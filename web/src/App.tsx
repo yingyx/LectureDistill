@@ -6,6 +6,7 @@ import Outputs from './pages/Outputs';
 import Jobs from './pages/Jobs';
 import Settings from './pages/Settings';
 import Processing from './pages/Processing';
+import Logs from './pages/Logs';
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="/processing" element={<Processing />} />
         <Route path="/outputs" element={<Outputs />} />
         <Route path="/jobs" element={<Jobs />} />
+        <Route path="/logs" element={<Logs />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

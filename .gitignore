@@ -1,5 +1,6 @@
 # Codex
 .codex
+.loop-pilot/runs/
 
 # Rust
 target/

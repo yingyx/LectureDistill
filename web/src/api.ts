@@ -285,6 +285,30 @@ export interface DiffLine {
   content: string;
 }
 
+// ---------------------------------------------------------------------------
+// LLM log types
+// ---------------------------------------------------------------------------
+
+export interface LlmLogMeta {
+  id: string;
+  created_at: string;
+  finished_at: string;
+  duration_ms: number;
+  status: string;
+  kind: string;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  response_format?: string;
+  error?: string;
+  preview?: string;
+}
+
+export interface LlmLogsResponse {
+  logs: LlmLogMeta[];
+  error?: string;
+}
+
 class ApiClient {
   private base: string;
 
@@ -491,6 +515,15 @@ class ApiClient {
   // Streaming ask URL builder (for EventSource)
   askStreamUrl(sourceId: string, question: string): string {
     return `/api/sources/${encodeURIComponent(sourceId)}/ask-stream?question=${encodeURIComponent(question)}`;
+  }
+
+  // LLM logs
+  async getLlmLogs(limit = 100): Promise<LlmLogsResponse> {
+    return this.fetch(`/api/llm-logs?limit=${limit}`);
+  }
+
+  async getLlmLog(logId: string): Promise<Record<string, unknown>> {
+    return this.fetch(`/api/llm-logs/${encodeURIComponent(logId)}`);
   }
 
   // Processes

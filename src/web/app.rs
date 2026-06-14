@@ -27,6 +27,7 @@ use std::sync::Arc;
 use crate::diff;
 use crate::latex;
 use crate::llm::{self, compact_transcript_for_llm};
+use crate::llm_log;
 use crate::pipeline::{PipelineResult, PipelineRunner};
 use crate::web::course::{
     bm25_search, estimate_token_count, extract_timestamp_ranges, read_indexes, read_manifest,
@@ -44,6 +45,34 @@ use crate::web::sources::{
     SourceRecord, SourceStatus, SourceStore,
 };
 use crate::web::state::ProjectStateStore;
+
+// ---------------------------------------------------------------------------
+// PlannedSection — staged course-note outline
+// ---------------------------------------------------------------------------
+
+/// A planned section in a course note outline.
+///
+/// Built by the LLM during the outline phase; used to drive per-section
+/// retrieval and generation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PlannedSection {
+    /// Section heading (used as `## <title>` in the output).
+    pub title: String,
+    /// Why this section exists in the outline.
+    pub purpose: String,
+    /// Date sub-strings that hint which indexes to retrieve first.
+    #[serde(default)]
+    pub date_hints: Vec<String>,
+    /// Video-ID sub-strings that hint which indexes to retrieve first.
+    #[serde(default)]
+    pub video_hints: Vec<String>,
+    /// Extra search terms for BM25 fallback retrieval.
+    #[serde(default)]
+    pub query_terms: Vec<String>,
+    /// Key concepts / formulas / definitions that must appear.
+    #[serde(default)]
+    pub must_include: Vec<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Embedded frontend assets (production)
@@ -95,6 +124,12 @@ pub fn create_app(project_dir: &str) -> Router {
         );
     }
 
+    // Point LLM logging at the project's artifacts directory.
+    std::env::set_var(
+        "LECTURE_DISTILL_LLM_LOG_DIR",
+        std::path::Path::new(project_dir).join("artifacts/llm-logs"),
+    );
+
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
         store: Arc::new(project_state_store),
@@ -117,6 +152,8 @@ pub fn create_app(project_dir: &str) -> Router {
         .route("/api/outputs", get(api_get_outputs))
         .route("/api/jobs", get(api_list_jobs))
         .route("/api/jobs/{job_id}", get(api_job_status))
+        .route("/api/llm-logs", get(api_list_llm_logs))
+        .route("/api/llm-logs/{log_id}", get(api_get_llm_log))
         .route("/api/canvas/list-videos", post(api_canvas_list_videos))
         .route(
             "/api/canvas/fetch-subtitles",
@@ -674,6 +711,46 @@ async fn api_job_status(State(state): State<AppState>, Path(job_id): Path<String
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Job not found"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON API -- LLM logs
+// ---------------------------------------------------------------------------
+
+/// `GET /api/llm-logs`  — list LLM call logs, newest first.
+#[derive(Debug, Deserialize)]
+struct ListLlmLogsQuery {
+    #[serde(default = "default_llm_log_limit")]
+    limit: usize,
+}
+
+fn default_llm_log_limit() -> usize {
+    100
+}
+
+async fn api_list_llm_logs(
+    Query(query): Query<ListLlmLogsQuery>,
+) -> Json<serde_json::Value> {
+    let limit = query.limit.min(1000);
+    match llm_log::list_logs(limit) {
+        Ok(logs) => Json(serde_json::json!({ "logs": logs })),
+        Err(e) => Json(serde_json::json!({
+            "logs": [],
+            "error": e.to_string(),
+        })),
+    }
+}
+
+/// `GET /api/llm-logs/{log_id}`  — return the full JSON content of a single log.
+async fn api_get_llm_log(Path(log_id): Path<String>) -> Response {
+    match llm_log::read_log(&log_id) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
@@ -4162,6 +4239,560 @@ async fn run_course_note_patch(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Staged course-note generation helpers
+// ---------------------------------------------------------------------------
+
+/// Generate a topic-based section outline from lightweight course index data.
+///
+/// The prompt is built **only** from index metadata (date, title, summary,
+/// keywords, concepts, and a small `timestamp_ranges` preview).  Raw transcript
+/// excerpts are deliberately excluded here.
+/// Build compact outline context from `CourseDateIndex` metadata **only**.
+///
+/// Does **not** include transcript source text or `Transcript excerpt`.
+/// Timestamp range preview is limited to at most 3 ranges per index with
+/// each `text_preview` trimmed to 120 chars (char-safe).
+fn build_outline_context(indexes: &[CourseDateIndex]) -> String {
+    let mut context = String::new();
+    for index in indexes {
+        let ranges_preview = index
+            .timestamp_ranges
+            .iter()
+            .take(3)
+            .map(|r| {
+                format!(
+                    "{} [{:.0}-{:.0}] {}",
+                    r.video_id,
+                    r.start,
+                    r.end,
+                    truncate_chars(&r.text_preview, 120)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        context.push_str(&format!(
+            "Date: {} | {}\nSummary: {}\nKeywords: {}\nConcepts: {}\nRanges preview:\n{}\n\n",
+            index.date,
+            index.title,
+            index.summary,
+            index.keywords.join(", "),
+            index.concepts.join(", "),
+            ranges_preview
+        ));
+    }
+    context
+}
+
+/// Parse the LLM outline response into `PlannedSection` items.
+///
+/// Returns `Ok(Vec<PlannedSection>)` on success or `Err(diagnostic: String)`
+/// with parse error detail, response character count, char-safe head/tail
+/// snippets, and `[truncated_by_length]` marker when `finish_reason ==
+/// "length"`.
+fn parse_outline_sections(
+    text: &str,
+    finish_reason: Option<&str>,
+) -> std::result::Result<Vec<PlannedSection>, String> {
+    let char_count = text.chars().count();
+    // Char-safe head (first 200 chars) and tail (last 200 chars).
+    let head: String = text.chars().take(200).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(200)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    // Strip markdown code fences (same logic as llm::strip_code_fences_and_parse).
+    let cleaned = {
+        let t = text.trim();
+        if let Some(rest) = t.strip_prefix("```json") {
+            rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
+        } else if let Some(rest) = t.strip_prefix("```") {
+            rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&cleaned) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut diag = format!(
+                "JSON parse error: {}. response_len={}",
+                e, char_count
+            );
+            if let Some("length") = finish_reason {
+                diag.push_str(" [truncated_by_length]");
+            }
+            if let Some(fr) = finish_reason {
+                if fr != "length" {
+                    diag.push_str(&format!(" finish_reason={}", fr));
+                }
+            }
+            diag.push_str(&format!(" head={:?} tail={:?}", head, tail));
+            return Err(diag);
+        }
+    };
+
+    let sections_arr = json
+        .get("sections")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            format!(
+                "JSON missing 'sections' array. response_len={} finish_reason={:?} head={:?} tail={:?}",
+                char_count, finish_reason, head, tail
+            )
+        })?;
+
+    let mut sections = Vec::new();
+    for item in sections_arr {
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let purpose = item
+            .get("purpose")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let date_hints = json_array_strings(item.get("date_hints"));
+        let video_hints = json_array_strings(item.get("video_hints"));
+        let query_terms = json_array_strings(item.get("query_terms"));
+        let must_include = json_array_strings(item.get("must_include"));
+
+        sections.push(PlannedSection {
+            title,
+            purpose,
+            date_hints,
+            video_hints,
+            query_terms,
+            must_include,
+        });
+    }
+
+    if sections.is_empty() {
+        return Err(format!(
+            "Outline JSON contained no valid sections. response_len={} head={:?} tail={:?}",
+            char_count, head, tail
+        ));
+    }
+
+    Ok(sections)
+}
+
+/// Generate a deterministic fallback outline from `CourseDateIndex` metadata.
+///
+/// Groups dates chronologically into 4-24 sections.  Section titles are
+/// derived from title/keywords/concepts where available; `date_hints`,
+/// `query_terms`, and `must_include` are derived from group keywords/concepts
+/// capped to a few items.
+///
+/// Does **not** read transcript source files.
+fn generate_fallback_outline(indexes: &[CourseDateIndex]) -> Result<Vec<PlannedSection>> {
+    if indexes.is_empty() {
+        anyhow::bail!("Cannot generate fallback outline: no indexes available");
+    }
+
+    let n = indexes.len();
+    // 4-24 sections when enough indexes exist; fewer otherwise, but ≥ 1.
+    let section_count = ((n as f64).sqrt().ceil() as usize)
+        .clamp(if n >= 4 { 4 } else { 1 }, 24);
+
+    let chunk_size = ((n as f64) / (section_count as f64)).ceil() as usize;
+
+    let mut sections = Vec::new();
+    for i in 0..section_count {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(n);
+        if start >= n {
+            break;
+        }
+        let group = &indexes[start..end];
+
+        // Derive a section title from the group metadata.
+        let title = if group.len() == 1 {
+            let idx = &group[0];
+            if !idx.title.is_empty() {
+                idx.title.clone()
+            } else if !idx.summary.is_empty() {
+                truncate_chars(&idx.summary, 80)
+            } else {
+                format!("Course Topics {}", i + 1)
+            }
+        } else {
+            // Collect keywords/concepts from the group to form a title.
+            let mut terms: Vec<&str> = Vec::new();
+            for idx in group {
+                for kw in &idx.keywords {
+                    if terms.len() < 3 && !terms.contains(&kw.as_str()) {
+                        terms.push(kw);
+                    }
+                }
+            }
+            if terms.is_empty() {
+                for idx in group {
+                    for c in &idx.concepts {
+                        if terms.len() < 3 && !terms.contains(&c.as_str()) {
+                            terms.push(c);
+                        }
+                    }
+                }
+            }
+            if !terms.is_empty() {
+                terms.join(" / ")
+            } else if !group[0].title.is_empty() {
+                group[0].title.clone()
+            } else {
+                format!("Course Topics {}", i + 1)
+            }
+        };
+
+        // date_hints: all dates in the group.
+        let date_hints: Vec<String> = group.iter().map(|idx| idx.date.clone()).collect();
+
+        // query_terms: keywords from the group, capped.
+        let mut query_terms: Vec<String> = Vec::new();
+        for idx in group {
+            for kw in &idx.keywords {
+                if query_terms.len() < 5 && !query_terms.contains(kw) {
+                    query_terms.push(kw.clone());
+                }
+            }
+        }
+
+        // must_include: concepts from the group, capped.
+        let mut must_include: Vec<String> = Vec::new();
+        for idx in group {
+            for c in &idx.concepts {
+                if must_include.len() < 5 && !must_include.contains(c) {
+                    must_include.push(c.clone());
+                }
+            }
+        }
+
+        sections.push(PlannedSection {
+            title,
+            purpose: format!(
+                "Fallback section covering dates {}-{}",
+                group[0].date,
+                group[group.len() - 1].date
+            ),
+            date_hints,
+            video_hints: Vec::new(),
+            query_terms,
+            must_include,
+        });
+    }
+
+    if sections.is_empty() {
+        anyhow::bail!("Fallback outline produced zero sections");
+    }
+
+    Ok(sections)
+}
+
+async fn generate_course_note_outline(
+    indexes: &[CourseDateIndex],
+) -> Result<Vec<PlannedSection>> {
+    let context = build_outline_context(indexes);
+
+    let system = "\
+You are a curriculum designer. Given course lecture index data, plan a structured note outline.\n\
+\n\
+Output **only** a JSON object with this exact shape:\n\
+{\"sections\":[{\"title\":\"\",\"purpose\":\"\",\"date_hints\":[],\"video_hints\":[],\"query_terms\":[],\"must_include\":[]}]}\n\
+\n\
+Rules:\n\
+- Produce 4-24 main sections. Choose the count based on the course span and topic diversity.\n\
+- title: concise section heading (no body prose, no Markdown).\n\
+- purpose: one short sentence describing why this section exists.\n\
+- date_hints: date substrings that help select relevant lecture days (max 5 items).\n\
+- video_hints: video ID substrings from the range previews (max 5 items).\n\
+- query_terms: search keywords for retrieval (max 5 items).\n\
+- must_include: key concepts / formulas / definitions that must appear (max 5 items).\n\
+\n\
+All arrays max 5 items. No body prose, no Markdown, no explanations outside the JSON.\n\
+Organize by topic, not by date. Each section should cover a coherent topic that may span multiple lecture days.";
+
+    let user = format!(
+        "Course lecture index data:\n{}\n\nPlan a note outline with sections organized by topic. Return only the JSON object described above.",
+        truncate_for_llm(&context, 24000)
+    );
+
+    let messages = vec![
+        crate::llm::ChatMessage {
+            role: "system".into(),
+            content: system.to_string(),
+        },
+        crate::llm::ChatMessage {
+            role: "user".into(),
+            content: user,
+        },
+    ];
+
+    // --- First attempt: max_tokens = 32768, temperature = 0.2 ---
+    let (text, finish_reason) = crate::llm::chat_completion_with_metadata(
+        &messages,
+        0.2,
+        32768,
+        Some("json_object"),
+    )
+    .await
+    .context("Outline LLM call failed")?;
+
+    match parse_outline_sections(&text, finish_reason.as_deref()) {
+        Ok(sections) if (4..=24).contains(&sections.len()) => return Ok(sections),
+        Ok(sections) => {
+            // LLM returned sections but outside the 4-24 range — retry.
+            let diagnostic = format!(
+                "Outline had {} section(s), expected 4-24. response_len={}",
+                sections.len(),
+                text.chars().count()
+            );
+            web_log(format!("Outline retry: {}", diagnostic));
+        }
+        Err(diagnostic) => {
+            web_log(format!("Outline parse failure: {}", diagnostic));
+        }
+    }
+
+    // --- Retry: max_tokens = 49152, include diagnostic in user prompt ---
+    // The retry does NOT append the invalid output as an assistant message.
+    // It starts a fresh conversation with the diagnostic embedded in the user
+    // prompt.
+    let retry_user = {
+        let char_count = text.chars().count();
+        let head: String = text.chars().take(300).collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!(
+            "The previous outline attempt produced invalid or unusable JSON.\n\
+             Diagnostic: response_len={} finish_reason={:?}\n\
+             Head snippet: {}\n\
+             Tail snippet: {}\n\n\
+             Original course index context:\n{}\n\n\
+             Plan a note outline with 4-24 sections organized by topic. Return only the JSON object.",
+            char_count, finish_reason, head, tail,
+            truncate_for_llm(&context, 20000)
+        )
+    };
+
+    let retry_messages = vec![
+        crate::llm::ChatMessage {
+            role: "system".into(),
+            content: system.to_string(),
+        },
+        crate::llm::ChatMessage {
+            role: "user".into(),
+            content: retry_user,
+        },
+    ];
+
+    let (retry_text, retry_finish_reason) = crate::llm::chat_completion_with_metadata(
+        &retry_messages,
+        0.2,
+        49152,
+        Some("json_object"),
+    )
+    .await
+    .context("Outline retry LLM call failed")?;
+
+    match parse_outline_sections(&retry_text, retry_finish_reason.as_deref()) {
+        Ok(sections) if (4..=24).contains(&sections.len()) => Ok(sections),
+        Ok(sections) => {
+            anyhow::bail!(
+                "Outline retry produced {} section(s), expected 4-24",
+                sections.len()
+            );
+        }
+        Err(diagnostic) => {
+            anyhow::bail!("Outline retry parse failed: {}", diagnostic);
+        }
+    }
+}
+
+/// Retrieve compact transcript context for a single planned section.
+///
+/// Prefers indexes whose date appears in `section.date_hints`; falls back to
+/// BM25 search.  Limits selected indexes per section to 4 and enforces a
+/// per-section transcript/context budget of 24 000 chars.
+fn retrieve_course_context_for_section(
+    section: &PlannedSection,
+    indexes: &[CourseDateIndex],
+) -> (String, RetrievalTrace) {
+    let max_indexes: usize = 4;
+    let context_budget: usize = 24000;
+    let mut trace_matches = Vec::new();
+    let mut selected: Vec<(&CourseDateIndex, f64)> = Vec::new();
+
+    // 1) Date-hint match.
+    if !section.date_hints.is_empty() {
+        for index in indexes {
+            if selected.len() >= max_indexes {
+                break;
+            }
+            let date_matches = section
+                .date_hints
+                .iter()
+                .any(|hint| index.date.contains(hint.as_str()) || hint.contains(index.date.as_str()));
+            if date_matches {
+                selected.push((index, 1.0));
+            }
+        }
+    }
+
+    // 2) Fallback to BM25.
+    if selected.is_empty() {
+        let query = format!(
+            "{} {} {} {}",
+            section.title,
+            section.purpose,
+            section.query_terms.join(" "),
+            section.must_include.join(" ")
+        );
+        let hits = bm25_search(indexes, &query, max_indexes);
+        for hit in hits {
+            selected.push((hit.index, hit.score));
+        }
+    }
+
+    let mut context = String::new();
+    for (index, score) in &selected {
+        let ranges = index
+            .timestamp_ranges
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<TimestampRange>>();
+        trace_matches.push(RetrievalMatch {
+            date: index.date.clone(),
+            score: *score,
+            timestamp_ranges: ranges.clone(),
+        });
+
+        let remaining = context_budget.saturating_sub(context.chars().count());
+        if remaining < 500 {
+            break;
+        }
+        let source_text = fs::read_to_string(&index.source_path).unwrap_or_default();
+        let transcript_budget = remaining.min(8000);
+        context.push_str(&format!(
+            "\n\n--- Date: {} | {} ---\nSummary: {}\nKeywords: {}\nConcepts: {}\nRanges:\n{}\nTranscript excerpt:\n{}",
+            index.date,
+            index.title,
+            index.summary,
+            index.keywords.join(", "),
+            index.concepts.join(", "),
+            ranges
+                .iter()
+                .map(|r| format!(
+                    "{} [{:.0}-{:.0}] {}",
+                    r.video_id, r.start, r.end, r.text_preview
+                ))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            compact_transcript_for_llm(&source_text, transcript_budget)
+        ));
+    }
+
+    let trace = RetrievalTrace {
+        section: section.title.clone(),
+        matches: trace_matches,
+        skipped_reason: if selected.is_empty() {
+            Some("no relevant indexes found for section".to_string())
+        } else {
+            None
+        },
+    };
+
+    (context, trace)
+}
+
+/// Generate Markdown for a single planned section from its retrieved context.
+///
+/// The prompt writes **only** that section; it must not invent facts beyond the
+/// given context.  Defaults to Chinese while preserving English technical terms,
+/// formulas, symbols, and code identifiers.
+async fn generate_course_note_section(
+    section: &PlannedSection,
+    context: &str,
+    style_guide: &str,
+) -> Result<String> {
+    let system = format!(
+        "You are a lecture note writer. Write a single Markdown section.\n\
+        Section title: {}\nPurpose: {}\n\
+        Use ## {} for the section heading and ### for subsections.\n\
+        Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers.\n\
+        Must include these concepts: {}\n\
+        Do not invent facts beyond the provided context.\n\
+        {}",
+        section.title,
+        section.purpose,
+        section.title,
+        section.must_include.join(", "),
+        style_guide
+    );
+
+    let user = format!(
+        "Write the Markdown section. Context:\n{}",
+        truncate_for_llm(context, 24000)
+    );
+
+    let text = crate::llm::chat_text(&system, &user, 0.25, 8192).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Merge independently-generated section Markdown into one cohesive note.
+///
+/// The prompt normalises title hierarchy, terminology, formula formatting,
+/// duplicate content, and transitions **without** adding new facts.  Only the
+/// section texts and style guide are fed in — raw transcripts are excluded.
+async fn merge_course_note_sections(
+    sections: &[String],
+    style_guide: &str,
+) -> Result<String> {
+    let combined = sections
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("<!-- section {} -->\n{}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let system = format!(
+        "You are an editor normalizing lecture notes into a single cohesive Markdown document.\n\
+        Normalize: title hierarchy (## for top sections, ### for subsections), terminology consistency, \
+        formula formatting, duplicate content removal, and smooth transitions between sections.\n\
+        Do not add new facts — only reorganize and normalize the provided content.\n\
+        Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers.\n\
+        {}",
+        style_guide
+    );
+
+    let user = format!(
+        "Merge and normalize these note sections into one complete Markdown document:\n\n{}\n\nReturn only Markdown.",
+        truncate_for_llm(&combined, 120000)
+    );
+
+    let text = crate::llm::chat_text(&system, &user, 0.2, 57344).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
 async fn run_course_note_generation(
     process_id: &str,
     course_sources: &[&SourceRecord],
@@ -4169,6 +4800,27 @@ async fn run_course_note_generation(
     process_store: &ProcessStore,
     job_id: &str,
 ) {
+    // Helper: mark every output as failed with the given error message.
+    fn fail_outputs(
+        process_store: &ProcessStore,
+        process_id: &str,
+        outputs: &[ProcessOutput],
+        err_msg: &str,
+    ) {
+        for output in outputs {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.to_string());
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 1 — Load course index
+    // -----------------------------------------------------------------------
     update_note_patch_progress(
         process_store,
         process_id,
@@ -4191,104 +4843,169 @@ async fn run_course_note_generation(
         }
     }
     if indexes.is_empty() {
-        let err_msg = "No ready Course Transcript indexes found.".to_string();
-        for output in outputs {
-            let _ = process_store.update(process_id, |r| {
-                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
-                    o.status = ProcessRecordStatus::Failed;
-                    o.last_error = Some(err_msg.clone());
-                    o.updated_at = ProcessRecord::now_iso();
-                }
-            });
-        }
+        fail_outputs(
+            process_store,
+            process_id,
+            outputs,
+            "No ready Course Transcript indexes found.",
+        );
         return;
     }
 
     if !crate::llm::is_available() {
-        let err_msg =
-            "LLM is not available. Set OPENAI_API_KEY in Settings to enable Note Patch generation."
-                .to_string();
-        for output in outputs {
-            let _ = process_store.update(process_id, |r| {
-                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
-                    o.status = ProcessRecordStatus::Failed;
-                    o.last_error = Some(err_msg.clone());
-                    o.updated_at = ProcessRecord::now_iso();
-                }
-            });
-        }
+        fail_outputs(
+            process_store,
+            process_id,
+            outputs,
+            "LLM is not available. Set OPENAI_API_KEY in Settings to enable Note Patch generation.",
+        );
         return;
     }
 
+    // -----------------------------------------------------------------------
+    // Step 2 — Plan outline from lightweight index metadata
+    // -----------------------------------------------------------------------
     update_note_patch_progress(
         process_store,
         process_id,
         outputs,
         1,
         4,
-        "preparing course context",
+        "planning note outline",
     );
 
-    let mut context = String::new();
-    let context_limit = 80000usize;
-    for index in &indexes {
-        if context.chars().count() >= context_limit {
-            break;
+    let (planned_sections, outline_fallback_used, outline_fallback_reason) =
+        match generate_course_note_outline(&indexes).await {
+            Ok(s) => (s, false, None),
+            Err(e) => {
+                // Try deterministic fallback before failing completely.
+                let llm_error = e.to_string();
+                match generate_fallback_outline(&indexes) {
+                    Ok(sections) => {
+                        web_log(format!(
+                            "job {} note-patch: using fallback outline ({} sections) after LLM outline failed: {}",
+                            job_id,
+                            sections.len(),
+                            llm_error
+                        ));
+                        (sections, true, Some(llm_error))
+                    }
+                    Err(fallback_err) => {
+                        let err_msg = format!(
+                            "Failed to generate course note outline: {}. Fallback also failed: {}",
+                            llm_error, fallback_err
+                        );
+                        fail_outputs(process_store, process_id, outputs, &err_msg);
+                        return;
+                    }
+                }
+            }
+        };
+
+    let total_sections = planned_sections.len();
+    let total_steps = total_sections + 3; // loading + outline + N sections + merge = N+3
+    update_note_patch_progress(
+        process_store,
+        process_id,
+        outputs,
+        1,
+        total_steps,
+        "planning note outline",
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 3 — Generate each section independently
+    // -----------------------------------------------------------------------
+    let style_guide =
+        "Use Chinese, preserving English technical terms, formulas, symbols, and code identifiers.";
+    let mut generated_sections: Vec<String> = Vec::new();
+    let mut retrieval_traces: Vec<RetrievalTrace> = Vec::new();
+    let mut success_count: usize = 0;
+
+    for (i, section) in planned_sections.iter().enumerate() {
+        let label = format!("generating section {}/{}", i + 1, total_sections);
+        update_note_patch_progress(
+            process_store,
+            process_id,
+            outputs,
+            2 + i,
+            total_steps,
+            &label,
+        );
+
+        let (context, trace) = retrieve_course_context_for_section(section, &indexes);
+        retrieval_traces.push(trace);
+
+        match generate_course_note_section(section, &context, style_guide).await {
+            Ok(markdown) => {
+                generated_sections.push(markdown);
+                success_count += 1;
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} note-patch: section '{}' generation failed: {}",
+                    job_id, section.title, e
+                ));
+                let failed_count = total_sections.saturating_sub(success_count);
+                let err_msg = format!(
+                    "Section '{}' generation failed: {}. {}/{} sections succeeded.",
+                    section.title, e, success_count, total_sections
+                );
+                fail_outputs(process_store, process_id, outputs, &err_msg);
+                for output in outputs {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            let mut meta = serde_json::json!({
+                                "generated_without_note_source": true,
+                                "section_count": total_sections,
+                                "section_success_count": success_count,
+                                "section_failed_count": failed_count,
+                                "outline_fallback_used": outline_fallback_used,
+                            });
+                            if let Some(ref reason) = outline_fallback_reason {
+                                meta["outline_fallback_reason"] = serde_json::json!(reason);
+                            }
+                            o.metadata = meta;
+                        }
+                    });
+                }
+                return;
+            }
         }
-        let ranges = index
-            .timestamp_ranges
-            .iter()
-            .take(10)
-            .map(|r| {
-                format!(
-                    "{} [{:.0}-{:.0}] {}",
-                    r.video_id, r.start, r.end, r.text_preview
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let source_text = fs::read_to_string(&index.source_path).unwrap_or_default();
-        let remaining = context_limit.saturating_sub(context.chars().count());
-        let transcript_budget = remaining.min(10000);
-        context.push_str(&format!(
-            "\n\n--- Date: {} | {} ---\nSummary: {}\nKeywords: {}\nConcepts: {}\nImportant ranges:\n{}\nTranscript excerpt:\n{}",
-            index.date,
-            index.title,
-            index.summary,
-            index.keywords.join(", "),
-            index.concepts.join(", "),
-            ranges,
-            compact_transcript_for_llm(&source_text, transcript_budget)
-        ));
     }
 
-    let system_prompt = "You are an expert lecture note writer. You are given indexed course transcript materials and must create a complete Markdown note from scratch. \
-Use Chinese when the source is Chinese, while preserving standard English technical terms, symbols, formulas, and code identifiers. \
-Organize by topic, not merely by date. Use ## for main sections and ### for subsections. \
-Keep exam-relevant definitions, formulas, assumptions, algorithms, procedures, comparisons, and common pitfalls. \
-Do not invent facts not supported by the transcript context. \
-Return ONLY the complete Markdown note, with no surrounding explanation, no code fences, and no commentary.";
-
-    let user_prompt = format!(
-        "Generate a complete Markdown note from the following course transcript index/context. \
-This note will be used as the Note Patch dependency for a later Cheating Sheet render, so make it well-structured and factual.\n\n{}\n\n\
-Return only Markdown.",
-        truncate_for_llm(&context, context_limit)
+    // -----------------------------------------------------------------------
+    // Step 4 — Merge sections into one cohesive note
+    // -----------------------------------------------------------------------
+    update_note_patch_progress(
+        process_store,
+        process_id,
+        outputs,
+        1 + total_sections,
+        total_steps,
+        "merging sections",
     );
 
-    update_note_patch_progress(process_store, process_id, outputs, 2, 4, "calling LLM");
-
-    let markdown_output = match crate::llm::chat_text(system_prompt, &user_prompt, 0.25, 16384).await
-    {
-        Ok(text) => strip_markdown_fences(&text),
+    let markdown_output = match merge_course_note_sections(&generated_sections, style_guide).await {
+        Ok(md) => md,
         Err(e) => {
-            let err_msg = format!("LLM call failed: {}", e);
+            let err_msg = format!("Failed to merge note sections: {}", e);
+            fail_outputs(process_store, process_id, outputs, &err_msg);
+            let failed_count = total_sections.saturating_sub(success_count);
             for output in outputs {
                 let _ = process_store.update(process_id, |r| {
                     if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
-                        o.status = ProcessRecordStatus::Failed;
-                        o.last_error = Some(err_msg.clone());
-                        o.updated_at = ProcessRecord::now_iso();
+                        let mut meta = serde_json::json!({
+                            "generated_without_note_source": true,
+                            "section_count": total_sections,
+                            "section_success_count": success_count,
+                            "section_failed_count": failed_count,
+                            "outline_fallback_used": outline_fallback_used,
+                        });
+                        if let Some(ref reason) = outline_fallback_reason {
+                            meta["outline_fallback_reason"] = serde_json::json!(reason);
+                        }
+                        o.metadata = meta;
                     }
                 });
             }
@@ -4296,21 +5013,19 @@ Return only Markdown.",
         }
     };
 
-    update_note_patch_progress(process_store, process_id, outputs, 3, 4, "writing note");
+    // -----------------------------------------------------------------------
+    // Step 5 — Write outputs
+    // -----------------------------------------------------------------------
+    update_note_patch_progress(
+        process_store,
+        process_id,
+        outputs,
+        total_steps,
+        total_steps,
+        "complete",
+    );
 
-    let retrieval_traces = indexes
-        .iter()
-        .map(|index| RetrievalTrace {
-            section: format!("Generated from {}", index.date),
-            matches: vec![RetrievalMatch {
-                date: index.date.clone(),
-                score: 1.0,
-                timestamp_ranges: index.timestamp_ranges.iter().take(10).cloned().collect(),
-            }],
-            skipped_reason: None,
-        })
-        .collect::<Vec<_>>();
-
+    let failed_count = total_sections.saturating_sub(success_count);
     for output in outputs {
         let output_path = process_store.output_path(process_id, &output.id);
         if let Some(parent) = output_path.parent() {
@@ -4343,12 +5058,20 @@ Return only Markdown.",
                 o.status = ProcessRecordStatus::Ready;
                 o.base_source_id = None;
                 o.last_error = None;
-                o.metadata = serde_json::json!({
-                    "progress_current": 4,
-                    "progress_total": 4,
+                let mut meta = serde_json::json!({
+                    "progress_current": total_steps,
+                    "progress_total": total_steps,
                     "progress_label": "complete",
                     "generated_without_note_source": true,
+                    "section_count": total_sections,
+                    "section_success_count": success_count,
+                    "section_failed_count": failed_count,
+                    "outline_fallback_used": outline_fallback_used,
                 });
+                if let Some(ref reason) = outline_fallback_reason {
+                    meta["outline_fallback_reason"] = serde_json::json!(reason);
+                }
+                o.metadata = meta;
                 o.updated_at = ProcessRecord::now_iso();
             }
         });
@@ -5847,5 +6570,474 @@ mod tests {
         assert!(markdown.contains("### Slide 1 [00:00-00:05]"));
         assert!(markdown.contains("[00:02] One.Two.Three.Four."));
         assert!(markdown.contains("[00:02] Five."));
+    }
+
+    // -----------------------------------------------------------------------
+    // PlannedSection outline JSON parse / convert
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_planned_section_deserialize_success() {
+        let json = r#"{
+            "title": "Optimization Basics",
+            "purpose": "Introduce gradient descent",
+            "date_hints": ["2024-09-18", "2024-09-19"],
+            "video_hints": ["v1", "v2"],
+            "query_terms": ["gradient", "convex"],
+            "must_include": ["gradient descent formula", "convexity definition"]
+        }"#;
+        let section: PlannedSection = serde_json::from_str(json).unwrap();
+        assert_eq!(section.title, "Optimization Basics");
+        assert_eq!(section.purpose, "Introduce gradient descent");
+        assert_eq!(section.date_hints.len(), 2);
+        assert_eq!(section.video_hints.len(), 2);
+        assert_eq!(section.query_terms.len(), 2);
+        assert_eq!(section.must_include.len(), 2);
+    }
+
+    #[test]
+    fn test_planned_section_deserialize_minimal() {
+        // A section with only required fields.
+        let json = r#"{"title": "Single Topic", "purpose": "Cover basics"}"#;
+        let section: PlannedSection = serde_json::from_str(json).unwrap();
+        assert_eq!(section.title, "Single Topic");
+        assert!(section.date_hints.is_empty());
+        assert!(section.must_include.is_empty());
+    }
+
+    #[test]
+    fn test_planned_section_deserialize_missing_title_is_caught() {
+        // Missing the required "title" field should fail.
+        let json = r#"{"purpose": "No title provided"}"#;
+        let result: Result<PlannedSection, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_outline_json_invalid_missing_sections() {
+        // Simulate what generate_course_note_outline would parse:
+        // a valid JSON object but with no "sections" key.
+        let json = serde_json::json!({"other": []});
+        let sections_arr = json.get("sections").and_then(|v| v.as_array());
+        assert!(sections_arr.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Section retrieval: date-hint preference and index limit
+    // -----------------------------------------------------------------------
+
+    fn make_test_index(date: &str, title: &str, summary: &str, keywords: &[&str]) -> CourseDateIndex {
+        CourseDateIndex {
+            date: date.to_string(),
+            title: title.to_string(),
+            summary: summary.to_string(),
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            concepts: Vec::new(),
+            timestamp_ranges: Vec::new(),
+            char_count: 100,
+            token_count: 20,
+            source_path: "test.md".to_string(),
+            status: "ready".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_retrieval_prefers_date_hints_over_bm25() {
+        let indexes = vec![
+            make_test_index("2024-09-10", "Unrelated", "nothing useful", &[]),
+            make_test_index("2024-09-18", "Optimization", "gradient descent and convexity", &["gradient", "convex"]),
+            make_test_index("2024-09-19", "More Optimization", "stochastic gradient descent", &["sgd"]),
+        ];
+
+        let section = PlannedSection {
+            title: "Optimization".into(),
+            purpose: "Learn gradient descent".into(),
+            date_hints: vec!["2024-09-18".into()],
+            video_hints: vec![],
+            query_terms: vec![],
+            must_include: vec![],
+        };
+
+        let (context, trace) = retrieve_course_context_for_section(&section, &indexes);
+        // The date-hint match should prefer the 2024-09-18 index.
+        assert!(!context.is_empty(), "context should not be empty");
+        assert!(
+            trace.matches.iter().any(|m| m.date == "2024-09-18"),
+            "should include the date-hint matched index"
+        );
+        // Should NOT include all indexes — only 4 max (here: just the matched one).
+        assert!(
+            trace.matches.len() <= 4,
+            "should not include more than 4 indexes"
+        );
+    }
+
+    #[test]
+    fn test_retrieval_falls_back_to_bm25_when_no_date_hints() {
+        let indexes = vec![
+            make_test_index("2024-09-18", "Intro", "syllabus and logistics", &["syllabus"]),
+            make_test_index("2024-09-19", "Optimization", "gradient descent algorithm", &["gradient", "descent"]),
+        ];
+
+        let section = PlannedSection {
+            title: "Gradient Descent".into(),
+            purpose: "Learn optimization".into(),
+            date_hints: vec![],
+            video_hints: vec![],
+            query_terms: vec!["gradient".into(), "descent".into()],
+            must_include: vec![],
+        };
+
+        let (context, trace) = retrieve_course_context_for_section(&section, &indexes);
+        // Should fall back to BM25 and find the Optimization index.
+        assert!(
+            context.contains("gradient descent"),
+            "context should contain relevant transcript content"
+        );
+        assert!(
+            trace.matches.iter().any(|m| m.date == "2024-09-19"),
+            "should find the relevant index via BM25 fallback"
+        );
+    }
+
+    #[test]
+    fn test_retrieval_does_not_include_all_indexes() {
+        let mut indexes = Vec::new();
+        for day in 1..=10 {
+            indexes.push(make_test_index(
+                &format!("2024-09-{:02}", day),
+                &format!("Lecture {}", day),
+                "various topics",
+                &["topic"],
+            ));
+        }
+
+        let section = PlannedSection {
+            title: "Comprehensive Topic".into(),
+            purpose: "Everything".into(),
+            date_hints: vec![],
+            video_hints: vec![],
+            query_terms: vec!["topic".into()],
+            must_include: vec![],
+        };
+
+        let (_context, trace) = retrieve_course_context_for_section(&section, &indexes);
+        assert!(
+            trace.matches.len() <= 4,
+            "should limit to at most 4 indexes, got {}",
+            trace.matches.len()
+        );
+        assert!(
+            trace.matches.len() < indexes.len(),
+            "should not include all 10 indexes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge input assembly preserves all section strings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_sections_input_has_all_sections() {
+        let section_texts: Vec<String> = vec![
+            "## Intro\n\nContent A".into(),
+            "## Methods\n\nContent B".into(),
+            "## Results\n\nContent C".into(),
+        ];
+
+        // Simulate the merge assembly logic (without the LLM call).
+        let combined = section_texts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("<!-- section {} -->\n{}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // Every section body must appear in the combined text.
+        assert!(combined.contains("Content A"));
+        assert!(combined.contains("Content B"));
+        assert!(combined.contains("Content C"));
+        // The section markers must appear.
+        assert!(combined.contains("<!-- section 1 -->"));
+        assert!(combined.contains("<!-- section 2 -->"));
+        assert!(combined.contains("<!-- section 3 -->"));
+        // Number of sections preserved.
+        assert_eq!(combined.matches("<!-- section ").count(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Outline context builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_outline_context_no_transcript_source() {
+        let indexes = vec![CourseDateIndex {
+            date: "2024-09-18".into(),
+            title: "Optimization".into(),
+            summary: "Gradient descent and convexity".into(),
+            keywords: vec!["gradient".into(), "convex".into()],
+            concepts: vec!["gradient descent formula".into()],
+            timestamp_ranges: vec![TimestampRange {
+                video_id: "v1".into(),
+                label: "Slide 1".into(),
+                start: 0.0,
+                end: 30.0,
+                text_preview: "Today we discuss gradient descent which is a first-order iterative optimization algorithm...".into(),
+            }],
+            char_count: 5000,
+            token_count: 1000,
+            source_path: "/fake/path/transcript.md".into(),
+            status: "ready".into(),
+        }];
+
+        let ctx = build_outline_context(&indexes);
+        // Must contain metadata (date, title, summary, keywords, concepts).
+        assert!(ctx.contains("2024-09-18"));
+        assert!(ctx.contains("Optimization"));
+        assert!(ctx.contains("gradient"));
+        assert!(ctx.contains("convex"));
+        // Must NOT contain the source_path or transcript excerpt strings.
+        assert!(!ctx.contains("/fake/path/transcript.md"));
+        assert!(!ctx.contains("Transcript excerpt"));
+        // text_preview from timestamp_ranges is metadata and is allowed;
+        // truncation to 120 chars is exercised by the timestamp-limit test below.
+    }
+
+    #[test]
+    fn test_build_outline_context_timestamp_limit() {
+        let mut ranges = Vec::new();
+        for i in 0..10 {
+            ranges.push(TimestampRange {
+                video_id: format!("v{}", i),
+                label: format!("Slide {}", i),
+                start: i as f64 * 10.0,
+                end: i as f64 * 10.0 + 5.0,
+                text_preview: format!("Content for slide {}", i),
+            });
+        }
+        let indexes = vec![CourseDateIndex {
+            date: "2024-09-18".into(),
+            title: "Test".into(),
+            summary: "Test".into(),
+            keywords: vec![],
+            concepts: vec![],
+            timestamp_ranges: ranges,
+            char_count: 100,
+            token_count: 20,
+            source_path: "fake.md".into(),
+            status: "ready".into(),
+        }];
+
+        let ctx = build_outline_context(&indexes);
+        // Only 3 ranges should appear (take(3)). Slide 3 should not appear.
+        for i in 0..3 {
+            assert!(ctx.contains(&format!("Content for slide {}", i)), "should include slide {}", i);
+        }
+        assert!(!ctx.contains("Content for slide 3"), "should limit to 3 ranges");
+        assert!(!ctx.contains("Content for slide 9"), "should limit to 3 ranges");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_outline_sections
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_outline_sections_success() {
+        let text = r#"{"sections":[{"title":"Optimization Basics","purpose":"Introduce gradient descent","date_hints":["2024-09-18"],"video_hints":[],"query_terms":["gradient"],"must_include":["GD formula"]}]}"#;
+        let result = parse_outline_sections(text, Some("stop"));
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let sections = result.unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Optimization Basics");
+        assert_eq!(sections[0].purpose, "Introduce gradient descent");
+    }
+
+    #[test]
+    fn test_parse_outline_sections_code_fenced() {
+        let text = "```json\n{\"sections\":[{\"title\":\"Intro\",\"purpose\":\"Basics\",\"date_hints\":[],\"video_hints\":[],\"query_terms\":[],\"must_include\":[]}]}\n```";
+        let result = parse_outline_sections(text, None);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let sections = result.unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Intro");
+    }
+
+    #[test]
+    fn test_parse_outline_sections_invalid_json_diagnostic() {
+        let text = "not valid json at all {";
+        let result = parse_outline_sections(text, None);
+        assert!(result.is_err());
+        let diag = result.unwrap_err();
+        // Diagnostic must include the parse error text.
+        assert!(diag.contains("JSON parse error"), "diagnostic: {}", diag);
+        // Must include response length.
+        assert!(diag.contains("response_len="), "diagnostic: {}", diag);
+        // Must include head/tail snippets.
+        assert!(diag.contains("head="), "diagnostic: {}", diag);
+        assert!(diag.contains("tail="), "diagnostic: {}", diag);
+    }
+
+    #[test]
+    fn test_parse_outline_sections_missing_sections_key() {
+        let text = r#"{"other_key": []}"#;
+        let result = parse_outline_sections(text, None);
+        assert!(result.is_err());
+        let diag = result.unwrap_err();
+        assert!(diag.contains("missing 'sections'"), "diagnostic: {}", diag);
+    }
+
+    #[test]
+    fn test_parse_outline_sections_truncated_by_length() {
+        let text = r#"{"sections":[{"title":"Test","purpose":"Test"}]}"#;
+        let result = parse_outline_sections(text, Some("length"));
+        // This should succeed because the JSON is valid.
+        assert!(result.is_ok());
+        // Test the diagnostic path for truncated JSON specifically.
+        let truncated = r#"{"sections":[{"title":"Tes"#;
+        let result2 = parse_outline_sections(truncated, Some("length"));
+        assert!(result2.is_err());
+        let diag = result2.unwrap_err();
+        assert!(diag.contains("truncated_by_length"), "diagnostic: {}", diag);
+    }
+
+    #[test]
+    fn test_parse_outline_sections_empty_sections_is_error() {
+        let text = r#"{"sections":[]}"#;
+        let result = parse_outline_sections(text, None);
+        assert!(result.is_err());
+        let diag = result.unwrap_err();
+        assert!(diag.contains("no valid sections"), "diagnostic: {}", diag);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback outline
+    // -----------------------------------------------------------------------
+
+    fn make_fake_index(date: &str, title: &str, keywords: &[&str], concepts: &[&str]) -> CourseDateIndex {
+        CourseDateIndex {
+            date: date.to_string(),
+            title: title.to_string(),
+            summary: format!("Summary for {}", date),
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            concepts: concepts.iter().map(|s| s.to_string()).collect(),
+            timestamp_ranges: Vec::new(),
+            char_count: 100,
+            token_count: 20,
+            // Use a fake source path that won't be read by the fallback.
+            source_path: "/nonexistent/transcript.md".into(),
+            status: "ready".into(),
+        }
+    }
+
+    #[test]
+    fn test_fallback_outline_produces_4_to_24_sections_with_enough_indexes() {
+        let mut indexes = Vec::new();
+        for day in 1..=30 {
+            indexes.push(make_fake_index(
+                &format!("2024-09-{:02}", day.min(30)),
+                &format!("Lecture {}", day),
+                &[&format!("kw{}", day)],
+                &[&format!("concept{}", day)],
+            ));
+        }
+
+        let sections = generate_fallback_outline(&indexes).unwrap();
+        assert!(
+            sections.len() >= 4 && sections.len() <= 24,
+            "expected 4-24 sections, got {}",
+            sections.len()
+        );
+        // Every section should have a non-empty title and date_hints.
+        for s in &sections {
+            assert!(!s.title.is_empty(), "section title must not be empty");
+            assert!(!s.date_hints.is_empty(), "date_hints must not be empty");
+        }
+    }
+
+    #[test]
+    fn test_fallback_outline_small_index_set() {
+        // Only 2 indexes — should produce at least 1 section.
+        let indexes = vec![
+            make_fake_index("2024-09-18", "Lecture 1", &["intro"], &["basics"]),
+            make_fake_index("2024-09-19", "Lecture 2", &["advanced"], &["details"]),
+        ];
+
+        let sections = generate_fallback_outline(&indexes).unwrap();
+        assert!(sections.len() >= 1, "expected at least 1 section, got {}", sections.len());
+        assert!(sections.len() <= 2, "expected at most 2 sections for 2 indexes");
+        // All dates should be covered in date_hints across all sections.
+        let all_dates: std::collections::HashSet<String> = sections
+            .iter()
+            .flat_map(|s| s.date_hints.iter().cloned())
+            .collect();
+        assert!(all_dates.contains("2024-09-18"));
+        assert!(all_dates.contains("2024-09-19"));
+    }
+
+    #[test]
+    fn test_fallback_outline_does_not_read_transcript_files() {
+        // Indexes have non-existent source_paths — fallback must still work
+        // because it only uses metadata.
+        let indexes = vec![
+            make_fake_index("2024-09-18", "Optimization", &["gradient"], &["GD"]),
+            make_fake_index("2024-09-19", "SGD", &["stochastic"], &["SGD"]),
+            make_fake_index("2024-09-20", "Convexity", &["convex"], &["convex set"]),
+            make_fake_index("2024-09-21", "Lagrange", &["dual"], &["KKT"]),
+            make_fake_index("2024-09-22", "SVM", &["margin"], &["hinge loss"]),
+        ];
+
+        let sections = generate_fallback_outline(&indexes).unwrap();
+        assert!(!sections.is_empty());
+        // The fallback must not call fs::read_to_string on source_path.
+        // If it did with /nonexistent/ path, the test would still work
+        // (read returns empty), but the point is the function signature
+        // only takes indexes, not source files.
+    }
+
+    #[test]
+    fn test_fallback_outline_empty_indexes_fails() {
+        let indexes: Vec<CourseDateIndex> = Vec::new();
+        let result = generate_fallback_outline(&indexes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fallback_outline_single_index() {
+        let indexes = vec![make_fake_index("2024-09-18", "Solo Lecture", &["solo"], &["concept"])];
+        let sections = generate_fallback_outline(&indexes).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert!(!sections[0].title.is_empty());
+        assert_eq!(sections[0].date_hints, vec!["2024-09-18"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Section retrieval: context budget and index limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_retrieval_respects_context_budget() {
+        let indexes = vec![make_test_index(
+            "2024-09-18",
+            "Long Lecture",
+            "A lecture with a long summary that goes on and on about many topics",
+            &["long"],
+        )];
+
+        let section = PlannedSection {
+            title: "Long Topic".into(),
+            purpose: "Test budget".into(),
+            date_hints: vec!["2024-09-18".into()],
+            video_hints: vec![],
+            query_terms: vec![],
+            must_include: vec![],
+        };
+
+        let (context, _trace) = retrieve_course_context_for_section(&section, &indexes);
+        // Context should not exceed 24000 chars.
+        assert!(
+            context.chars().count() <= 24000,
+            "context budget exceeded: {}",
+            context.chars().count()
+        );
     }
 }

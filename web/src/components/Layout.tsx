@@ -21,6 +21,7 @@ import OutputIcon from '@mui/icons-material/Output';
 import WorkIcon from '@mui/icons-material/Work';
 import SettingsIcon from '@mui/icons-material/Settings';
 import PlaylistAddCheckIcon from '@mui/icons-material/PlaylistAddCheck';
+import TerminalIcon from '@mui/icons-material/Terminal';
 
 const DRAWER_WIDTH = 220;
 
@@ -30,6 +31,7 @@ const navItems = [
   { to: '/processing', label: 'Processing', icon: <PlaylistAddCheckIcon /> },
   { to: '/outputs', label: 'Outputs', icon: <OutputIcon /> },
   { to: '/jobs', label: 'Jobs', icon: <WorkIcon /> },
+  { to: '/logs', label: 'LLM Logs', icon: <TerminalIcon /> },
   { to: '/settings', label: 'Settings', icon: <SettingsIcon /> },
 ];
 
