@@ -1,0 +1,58 @@
+# Codex
+.codex
+
+# Rust
+target/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Python
+lecture_distill/
+.venv/
+.uv-cache/
+.npm-cache/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+web/node_modules/
+
+# Environment & secrets
+.env
+*.env
+**/secrets.local.json
+
+# Generated outputs
+data/
+notes.patched.md
+distilled.md
+patches.json
+*.pdf
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Project state (may contain sensitive paths)
+.lecture-distill/projects/*/config.json
+.lecture-distill/projects/*/secrets.local.json
+
+# Logs
+*.log

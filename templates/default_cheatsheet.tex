@@ -1,0 +1,67 @@
+% !TEX program = xelatex
+\documentclass[a4paper]{article}
+\usepackage{iftex}
+\ifPDFTeX
+  \errmessage{The default lecture-distill cheat-sheet template requires XeLaTeX or latexmk -xelatex for Chinese text}
+\fi
+\usepackage[no-math]{fontspec}
+\usepackage{xeCJK}
+\usepackage[a4paper,left=0.5mm,right=0.5mm,top=0.5mm,bottom=0.5mm,noheadfoot]{geometry}
+\usepackage{xcolor}
+\usepackage{multicol}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{array,booktabs,tabularx}
+
+\IfFontExistsTF{Arial}{\setmainfont{Arial}}{\setmainfont{Latin Modern Roman}}
+\IfFontExistsTF{Microsoft YaHei}{\setCJKmainfont{Microsoft YaHei}}{%
+  \IfFontExistsTF{SimSun}{\setCJKmainfont{SimSun}}{\setCJKmainfont{Noto Sans CJK SC}}%
+}
+\defaultfontfeatures{Ligatures=TeX}
+\xeCJKsetup{CJKmath=true,CheckSingle=true,PunctStyle=kaiming}
+
+\definecolor{CheatTitleBlue}{HTML}{004D80}
+\definecolor{CheatAccentBlue}{HTML}{0076BA}
+\definecolor{CheatDividerGray}{HTML}{808080}
+
+\setlength{\columnsep}{2mm}
+\setlength{\columnseprule}{0pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\topskip}{0pt}
+\pagestyle{empty}
+\raggedright
+\emergencystretch=1em
+
+\makeatletter
+\renewcommand\normalsize{\@setfontsize\normalsize{5pt}{6pt}}
+\makeatother
+\normalsize
+
+\titleformat{\section}{\color{CheatTitleBlue}\fontsize{7pt}{7.5pt}\selectfont\bfseries}{}{0pt}{}
+\titleformat{\subsection}{\color{CheatTitleBlue}\fontsize{6pt}{6.5pt}\selectfont\bfseries}{}{0pt}{}
+\titleformat{\subsubsection}{\color{CheatAccentBlue}\fontsize{5.5pt}{6pt}\selectfont\bfseries}{}{0pt}{}
+\titleformat{\paragraph}[runin]{\color{CheatAccentBlue}\fontsize{5pt}{6pt}\selectfont\bfseries}{}{0pt}{}
+\titlespacing*{\section}{0pt}{1.2pt}{0.6pt}
+\titlespacing*{\subsection}{0pt}{0.9pt}{0.4pt}
+\titlespacing*{\subsubsection}{0pt}{0.6pt}{0.3pt}
+\titlespacing*{\paragraph}{0pt}{0.5pt}{0.4em}
+\setcounter{secnumdepth}{0}
+
+\setlist[itemize]{leftmargin=0.85em,label={-},labelsep=0.25em,itemsep=0pt,topsep=0pt,parsep=0pt,partopsep=0pt}
+\setlist[enumerate]{leftmargin=1.1em,labelsep=0.25em,itemsep=0pt,topsep=0pt,parsep=0pt,partopsep=0pt}
+\setlength{\abovedisplayskip}{1pt plus 0.5pt minus 0.5pt}
+\setlength{\belowdisplayskip}{1pt plus 0.5pt minus 0.5pt}
+\setlength{\abovedisplayshortskip}{0.5pt plus 0.5pt}
+\setlength{\belowdisplayshortskip}{0.5pt plus 0.5pt}
+\allowdisplaybreaks
+
+\newcommand{\divider}{\par\vspace{1pt}{\color{CheatDividerGray}\hrule height 0.4pt width \linewidth}\vspace{1pt}}
+\newenvironment{cheatsheet}{\begin{multicols*}{4}\raggedcolumns\normalsize}{\end{multicols*}}
+
+\begin{document}
+\begin{cheatsheet}
+{{content}}
+\end{cheatsheet}
+\end{document}

@@ -1,0 +1,41 @@
+[package]
+name = "lecture-distill"
+version = "0.1.0"
+edition = "2021"
+description = "SJTU Canvas video subtitle ingestion, Markdown notes patching, exam-focused distillation, and cheat sheet PDF rendering"
+license = "MIT"
+repository = ""
+
+[[bin]]
+name = "lecture-distill"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["cookies", "json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+regex = "1"
+axum = { version = "0.8", features = ["form"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+lopdf = "0.34"
+scraper = "0.22"
+url = "2"
+rand = "0.8"
+futures-util = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+log = "0.4"
+env_logger = "0.11"
+rust-embed = "8"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+tokio-test = "0.4"
