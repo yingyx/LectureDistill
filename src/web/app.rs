@@ -23,6 +23,7 @@ use std::convert::Infallible;
 use std::fs;
 use std::path::Path as FsPath;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::diff;
 use crate::latex;
@@ -193,6 +194,7 @@ pub fn create_app(project_dir: &str) -> Router {
             get(api_get_processes).post(api_create_process),
         )
         .route("/api/processes/{id}", get(api_get_process))
+        .route("/api/processes/{id}/retry", post(api_retry_process))
         .route("/api/processes/{id}/outputs", post(api_add_process_output))
         .route(
             "/api/processes/{id}/outputs/{output_id}",
@@ -201,6 +203,14 @@ pub fn create_app(project_dir: &str) -> Router {
         .route(
             "/api/processes/{id}/outputs/{output_id}/revise",
             post(api_revise_process_output),
+        )
+        .route(
+            "/api/processes/{id}/outputs/{output_id}/retry",
+            post(api_retry_process_output),
+        )
+        .route(
+            "/api/processes/{id}/outputs/{output_id}/stream",
+            get(api_stream_process_output),
         )
         // ------------------------------------------------------------------
         // Canvas LMS courses API
@@ -731,9 +741,7 @@ fn default_llm_log_limit() -> usize {
     100
 }
 
-async fn api_list_llm_logs(
-    Query(query): Query<ListLlmLogsQuery>,
-) -> Json<serde_json::Value> {
+async fn api_list_llm_logs(Query(query): Query<ListLlmLogsQuery>) -> Json<serde_json::Value> {
     let limit = query.limit.min(1000);
     match llm_log::list_logs(limit) {
         Ok(logs) => Json(serde_json::json!({ "logs": logs })),
@@ -3095,7 +3103,7 @@ async fn api_ask_source(
                 body.question,
                 truncate_for_llm(&context, 50000)
             );
-            match crate::llm::chat_text(system, &user, 0.3, 3072).await {
+            match crate::llm::chat_text(system, &user, 0.3, 8192).await {
                 Ok(answer) => Json(serde_json::json!({
                     "status": "succeeded",
                     "answer": answer,
@@ -3139,7 +3147,7 @@ async fn api_ask_source(
 
         if llm_available {
             // Use LLM with truncated source text.
-            let context = truncate_for_llm(&source_text, 20000);
+            let context = truncate_for_llm(&source_text, 40000);
             let system = "You answer questions about lecture transcript or note content. \
                           Be concise, cite specific sections and timestamps when relevant, \
                           and do not invent facts. Answer in the same language as the question.";
@@ -3148,7 +3156,7 @@ async fn api_ask_source(
                 source.title, body.question, context
             );
 
-            match crate::llm::chat_text(system, &user, 0.3, 2048).await {
+            match crate::llm::chat_text(system, &user, 0.3, 6144).await {
                 Ok(answer) => Json(serde_json::json!({
                     "status": "succeeded",
                     "answer": answer,
@@ -3284,7 +3292,7 @@ async fn api_source_ask_stream(
                     question,
                     truncate_for_llm(&context, 50000)
                 );
-                match crate::llm::chat_text(system, &user, 0.3, 3072).await {
+                match crate::llm::chat_text(system, &user, 0.3, 8192).await {
                     Ok(answer) => {
                         yield Ok::<Event, Infallible>(Event::default().event("chunk").data(answer));
                     }
@@ -3333,7 +3341,7 @@ async fn api_source_ask_stream(
             source.title, query.question, context
         );
 
-        match llm::chat_text_stream(system, &user, 0.3, 4096).await {
+        match llm::chat_text_stream(system, &user, 0.3, 8192).await {
             Ok(mut rx) => {
                 let stream = async_stream::stream! {
                     // Send initial metadata event.
@@ -3447,7 +3455,7 @@ async fn api_get_process(State(state): State<AppState>, Path(id): Path<String>) 
 
 /// `POST /api/processes` -- create a new process and start background jobs.
 ///
-/// Body: `{ title?: string, source_ids: string[], outputs: [{ kind: "note_patch" | "cheating_sheet", max_pages?: 2 }] }`
+/// Body: `{ title?: string, source_ids: string[], outputs: [{ kind: "note_patch" | "reference_digest" | "cheating_sheet", max_pages?: 2 }] }`
 #[derive(Debug, Deserialize)]
 struct CreateProcessBody {
     #[serde(default)]
@@ -3466,6 +3474,7 @@ struct CreateProcessOutputBody {
 fn parse_process_output_kind(kind: &str) -> Option<ProcessOutputKind> {
     match kind {
         "note_patch" => Some(ProcessOutputKind::NotePatch),
+        "reference_digest" => Some(ProcessOutputKind::ReferenceDigest),
         "cheating_sheet" => Some(ProcessOutputKind::CheatingSheet),
         _ => None,
     }
@@ -3474,6 +3483,7 @@ fn parse_process_output_kind(kind: &str) -> Option<ProcessOutputKind> {
 fn process_output_title(kind: &ProcessOutputKind) -> &'static str {
     match kind {
         ProcessOutputKind::NotePatch => "Note Patch",
+        ProcessOutputKind::ReferenceDigest => "Reference Digest",
         ProcessOutputKind::CheatingSheet => "Cheating Sheet",
     }
 }
@@ -3486,6 +3496,7 @@ fn process_output_path_for(
 ) -> std::path::PathBuf {
     match kind {
         ProcessOutputKind::NotePatch => process_store.output_path(process_id, output_id),
+        ProcessOutputKind::ReferenceDigest => process_store.output_path(process_id, output_id),
         ProcessOutputKind::CheatingSheet => process_store
             .process_dir(process_id)
             .join(format!("{}.pdf", output_id)),
@@ -3506,19 +3517,21 @@ fn expand_output_kinds(
     requested: &[CreateProcessOutputBody],
 ) -> std::result::Result<Vec<(ProcessOutputKind, usize)>, String> {
     let mut has_note_patch = false;
+    let mut has_reference_digest = false;
     let mut has_cheating_sheet = false;
     let mut cheating_sheet_pages = 2usize;
 
     for out in requested {
         match parse_process_output_kind(&out.kind) {
             Some(ProcessOutputKind::NotePatch) => has_note_patch = true,
+            Some(ProcessOutputKind::ReferenceDigest) => has_reference_digest = true,
             Some(ProcessOutputKind::CheatingSheet) => {
                 has_cheating_sheet = true;
                 cheating_sheet_pages = out.max_pages.unwrap_or(2).clamp(1, 20);
             }
             None => {
                 return Err(format!(
-                    "Unsupported output kind: {}. Supported kinds: note_patch, cheating_sheet.",
+                    "Unsupported output kind: {}. Supported kinds: note_patch, reference_digest, cheating_sheet.",
                     out.kind
                 ));
             }
@@ -3526,11 +3539,20 @@ fn expand_output_kinds(
     }
 
     let mut kinds = Vec::new();
-    if has_note_patch || has_cheating_sheet {
-        kinds.push((ProcessOutputKind::NotePatch, 2));
+    if has_note_patch || has_reference_digest || has_cheating_sheet {
+        // Note Patch is independent; only add if explicitly requested.
+        if has_note_patch {
+            kinds.push((ProcessOutputKind::NotePatch, 2));
+        }
     }
     if has_cheating_sheet {
+        // Cheating Sheet depends on Reference Digest, not Note Patch.
+        if !has_reference_digest {
+            kinds.push((ProcessOutputKind::ReferenceDigest, 0));
+        }
         kinds.push((ProcessOutputKind::CheatingSheet, cheating_sheet_pages));
+    } else if has_reference_digest {
+        kinds.push((ProcessOutputKind::ReferenceDigest, 0));
     }
     Ok(kinds)
 }
@@ -3657,6 +3679,13 @@ async fn api_create_process(
             "progress_total": 1,
             "progress_label": "queued",
         });
+        if *kind == ProcessOutputKind::ReferenceDigest {
+            metadata = serde_json::json!({
+                "progress_current": 0,
+                "progress_total": 2,
+                "progress_label": "queued",
+            });
+        }
         if *kind == ProcessOutputKind::CheatingSheet {
             metadata = serde_json::json!({
                 "progress_current": 0,
@@ -3753,6 +3782,461 @@ async fn api_create_process(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Process / Output retry
+// ---------------------------------------------------------------------------
+
+/// Query params for `POST /api/processes/{id}/retry`.
+#[derive(Debug, Deserialize)]
+struct RetryProcessQuery {
+    /// When `true`, reset all outputs and rerun from scratch.
+    #[serde(default)]
+    force: bool,
+}
+
+/// `POST /api/processes/{id}/retry` — retry failed outputs or force full rerun.
+async fn api_retry_process(
+    State(state): State<AppState>,
+    Path(process_id): Path<String>,
+    Query(query): Query<RetryProcessQuery>,
+) -> Json<serde_json::Value> {
+    let saved_secrets = state.secrets.load();
+    saved_secrets.apply_to_env();
+
+    let proc = match state.process_store.get(&process_id) {
+        Some(p) => p,
+        None => {
+            return Json(serde_json::json!({
+                "status": "failed",
+                "error": "Process not found"
+            }));
+        }
+    };
+
+    let outputs_to_retry: Vec<ProcessOutput> = if query.force {
+        // Force: reset ALL outputs.
+        let mut reset_outputs = Vec::new();
+        let _ = state.process_store.update(&process_id, |r| {
+            r.status = ProcessRecordStatus::Processing;
+            r.last_error = None;
+            for o in &mut r.outputs {
+                o.status = ProcessRecordStatus::Processing;
+                o.last_error = None;
+                let meta = &mut o.metadata;
+                meta["progress_current"] = serde_json::json!(0);
+                meta["progress_label"] = serde_json::json!("queued");
+                reset_outputs.push(o.clone());
+            }
+            r.updated_at = ProcessRecord::now_iso();
+        });
+        reset_outputs
+    } else {
+        // Smart retry: only failed outputs.
+        let mut failed_outputs = Vec::new();
+        let _ = state.process_store.update(&process_id, |r| {
+            r.status = ProcessRecordStatus::Processing;
+            r.last_error = None;
+            for o in &mut r.outputs {
+                if o.status == ProcessRecordStatus::Failed {
+                    o.status = ProcessRecordStatus::Processing;
+                    o.last_error = None;
+                    let meta = &mut o.metadata;
+                    meta["progress_current"] = serde_json::json!(0);
+                    meta["progress_label"] = serde_json::json!("retrying");
+                    failed_outputs.push(o.clone());
+                }
+            }
+            r.updated_at = ProcessRecord::now_iso();
+        });
+        if failed_outputs.is_empty() {
+            return Json(serde_json::json!({
+                "status": "succeeded",
+                "message": "No failed outputs to retry."
+            }));
+        }
+        failed_outputs
+    };
+
+    // Launch background job.
+    let registry = state.registry.clone();
+    let process_store = state.process_store.clone();
+    let source_store = state.source_store.clone();
+    let pid = process_id.clone();
+    let src_ids = proc.source_ids.clone();
+
+    let retried_ids: Vec<String> = outputs_to_retry.iter().map(|o| o.id.clone()).collect();
+    let job = registry.run_in_background("process-retry", move |job| {
+        web_log(format!(
+            "job {} process-retry started process_id={} force={}",
+            job.job_id, pid, query.force
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            run_process_outputs(
+                &pid,
+                &src_ids,
+                &outputs_to_retry,
+                &process_store,
+                &source_store,
+                &job.job_id,
+            )
+            .await;
+        });
+
+        update_process_terminal_status(&process_store, &pid, &job.job_id);
+
+        web_log(format!(
+            "job {} process-retry finished process_id={}",
+            job.job_id, pid
+        ));
+    });
+
+    Json(serde_json::json!({
+        "status": "processing",
+        "process_id": process_id,
+        "job_id": job.job_id,
+        "retried_outputs": retried_ids,
+    }))
+}
+
+/// `POST /api/processes/{id}/outputs/{output_id}/retry` — retry a single output.
+async fn api_retry_process_output(
+    State(state): State<AppState>,
+    Path((process_id, output_id)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    let saved_secrets = state.secrets.load();
+    saved_secrets.apply_to_env();
+
+    let proc = match state.process_store.get(&process_id) {
+        Some(p) => p,
+        None => {
+            return Json(serde_json::json!({
+                "status": "failed",
+                "error": "Process not found"
+            }));
+        }
+    };
+
+    // Find and reset the specific output.
+    let target_output = {
+        let output_idx = proc.outputs.iter().position(|o| o.id == output_id);
+        match output_idx {
+            Some(idx) => {
+                if proc.outputs[idx].status != ProcessRecordStatus::Failed
+                    && proc.outputs[idx].status != ProcessRecordStatus::Ready
+                {
+                    return Json(serde_json::json!({
+                        "status": "failed",
+                        "error": format!(
+                            "Output is not in a retryable state (status: {})",
+                            proc.outputs[idx].status.to_string()
+                        )
+                    }));
+                }
+                let mut o = proc.outputs[idx].clone();
+                o.status = ProcessRecordStatus::Processing;
+                o.last_error = None;
+                let meta = &mut o.metadata;
+                meta["progress_current"] = serde_json::json!(0);
+                meta["progress_label"] = serde_json::json!("retrying");
+                o.updated_at = ProcessRecord::now_iso();
+                o
+            }
+            None => {
+                return Json(serde_json::json!({
+                    "status": "failed",
+                    "error": "Output not found"
+                }));
+            }
+        }
+    };
+
+    // Persist the reset.
+    let output_kind = target_output.kind.clone();
+    let _ = state.process_store.update(&process_id, |r| {
+        r.status = ProcessRecordStatus::Processing;
+        r.last_error = None;
+        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output_id) {
+            o.status = ProcessRecordStatus::Processing;
+            o.last_error = None;
+            let meta = &mut o.metadata;
+            meta["progress_current"] = serde_json::json!(0);
+            meta["progress_label"] = serde_json::json!("retrying");
+            o.updated_at = ProcessRecord::now_iso();
+        }
+        r.updated_at = ProcessRecord::now_iso();
+    });
+
+    // Launch background job for this single output.
+    let registry = state.registry.clone();
+    let process_store = state.process_store.clone();
+    let source_store = state.source_store.clone();
+    let pid = process_id.clone();
+    let src_ids = proc.source_ids.clone();
+    let out_id = output_id.clone();
+
+    let job = registry.run_in_background("output-retry", move |job| {
+        web_log(format!(
+            "job {} output-retry started process_id={} output_id={}",
+            job.job_id, pid, out_id
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            match output_kind {
+                ProcessOutputKind::NotePatch => {
+                    run_note_patch(
+                        &pid,
+                        &src_ids,
+                        &[target_output],
+                        &process_store,
+                        &source_store,
+                        &job.job_id,
+                    )
+                    .await;
+                }
+                ProcessOutputKind::ReferenceDigest => {
+                    run_reference_digest_outputs(
+                        &pid,
+                        &src_ids,
+                        &[target_output],
+                        &process_store,
+                        &source_store,
+                        &job.job_id,
+                    )
+                    .await;
+                }
+                ProcessOutputKind::CheatingSheet => {
+                    run_cheating_sheet_outputs(&pid, &[target_output], &process_store, &job.job_id)
+                        .await;
+                }
+            }
+        });
+
+        update_process_terminal_status(&process_store, &pid, &job.job_id);
+
+        web_log(format!(
+            "job {} output-retry finished process_id={} output_id={}",
+            job.job_id, pid, out_id
+        ));
+    });
+
+    Json(serde_json::json!({
+        "status": "processing",
+        "process_id": process_id,
+        "output_id": output_id,
+        "job_id": job.job_id,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Streaming process output generation (SSE)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/processes/{id}/outputs/{output_id}/stream`
+///
+/// Runs LLM generation for the given output and streams the result as
+/// Server-Sent Events.  Uses the same prompt-building logic as the
+/// background-job path but sends each token chunk to the client in
+/// real-time via SSE.  The final result is saved to the process store.
+async fn api_stream_process_output(
+    State(state): State<AppState>,
+    Path((process_id, output_id)): Path<(String, String)>,
+) -> Response {
+    let saved_secrets = state.secrets.load();
+    saved_secrets.apply_to_env();
+
+    if !crate::llm::is_available() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "LLM is not available"})),
+        )
+            .into_response();
+    }
+
+    let proc = match state.process_store.get(&process_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Process not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let output = match proc.outputs.iter().find(|o| o.id == output_id) {
+        Some(o) => o.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Output not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let process_store = state.process_store.clone();
+    let source_store = state.source_store.clone();
+    let pid = process_id.clone();
+    let oid = output_id.clone();
+    let kind = output.kind.clone();
+
+    let sources = source_store.load_all();
+    // Owned data extracted before the SSE stream captures them.
+    let note_content: Option<String> = sources
+        .iter()
+        .find(|s| proc.source_ids.contains(&s.id) && s.kind == SourceKind::Note)
+        .and_then(|n| fs::read_to_string(&n.path).ok())
+        .map(|c| c.chars().take(50000).collect::<String>());
+    let transcript_paths: Vec<(String, String)> = sources
+        .iter()
+        .filter(|s| proc.source_ids.contains(&s.id) && s.kind == SourceKind::TranscriptDay)
+        .map(|s| (s.title.clone(), s.path.clone()))
+        .collect();
+
+    let build_transcript_context = move |limit: usize| -> String {
+        let mut ctx = String::new();
+        let per_src = if transcript_paths.is_empty() {
+            0
+        } else {
+            limit / transcript_paths.len()
+        };
+        for (title, path) in &transcript_paths {
+            if ctx.chars().count() >= limit {
+                break;
+            }
+            if let Ok(content) = fs::read_to_string(path) {
+                let compact = crate::llm::compact_transcript_for_llm(&content, per_src);
+                ctx.push_str(&format!("\n\n--- Source: {} ---\n", title));
+                ctx.push_str(&compact);
+            }
+        }
+        ctx
+    };
+
+    let stream = async_stream::stream! {
+        let _ = process_store.update(&pid, |r| {
+            r.status = ProcessRecordStatus::Processing;
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == oid) {
+                o.status = ProcessRecordStatus::Processing;
+                o.last_error = None;
+                o.metadata["progress_label"] = serde_json::json!("streaming");
+            }
+        });
+
+        yield Ok::<Event, Infallible>(
+            Event::default().event("meta").data(serde_json::json!({
+                "output_id": oid,
+                "kind": kind.to_string(),
+            }).to_string())
+        );
+
+        // Build prompt and call LLM with streaming based on output kind.
+        let llm_result: Result<(String, mpsc::Receiver<Result<String>>)> = async {
+            match &kind {
+                ProcessOutputKind::NotePatch => {
+                    let context = build_transcript_context(80000);
+                    let (sys, usr) = build_note_patch_prompts(
+                        note_content.is_some(),
+                        &context,
+                        80000,
+                    );
+                    let rx = crate::llm::chat_text_stream(&sys, &usr, 0.3, 32768).await?;
+                    Ok(("note_patch".to_string(), rx))
+                }
+                ProcessOutputKind::ReferenceDigest => {
+                    let context = build_transcript_context(100000);
+                    let sys = build_ref_digest_system_prompt();
+                    let usr = build_ref_digest_user_prompt(&note_content, &context, None);
+                    let rx = crate::llm::chat_text_stream(&sys, &usr, 0.25, 65536).await?;
+                    Ok(("ref_digest".to_string(), rx))
+                }
+                ProcessOutputKind::CheatingSheet => {
+                    let ref_digest = proc.outputs.iter()
+                        .find(|o| o.kind == ProcessOutputKind::ReferenceDigest && o.status == ProcessRecordStatus::Ready);
+                    let digest_md = match ref_digest {
+                        Some(o) => fs::read_to_string(&o.path).unwrap_or_default(),
+                        None => return Err(anyhow::anyhow!("Cheat Sheet requires a completed Reference Digest")),
+                    };
+                    let (sys, usr) = build_cheat_sheet_prompts(&digest_md, 2);
+                    let rx = crate::llm::chat_text_stream(&sys, &usr, 0.2, 65536).await?;
+                    Ok(("cheat_sheet".to_string(), rx))
+                }
+            }
+        }.await;
+
+        let (_label, mut rx) = match llm_result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = process_store.update(&pid, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == oid) {
+                        o.status = ProcessRecordStatus::Failed;
+                        o.last_error = Some(e.to_string());
+                    }
+                });
+                yield Ok::<Event, Infallible>(Event::default().event("error").data(e.to_string()));
+                return;
+            }
+        };
+
+        // Stream LLM chunks to the client.
+        let mut accumulated = String::new();
+        loop {
+            match rx.recv().await {
+                Some(Ok(text)) if !text.is_empty() => {
+                    accumulated.push_str(&text);
+                    yield Ok::<Event, Infallible>(Event::default().event("chunk").data(text));
+                }
+                Some(Ok(_)) => break, // empty = done
+                Some(Err(e)) => {
+                    let _ = process_store.update(&pid, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == oid) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(e.to_string());
+                        }
+                    });
+                    yield Ok::<Event, Infallible>(Event::default().event("error").data(e.to_string()));
+                    return;
+                }
+                None => break,
+            }
+        }
+
+        // Save and finalise.
+        let cleaned = strip_markdown_fences(&accumulated);
+        let output_path = process_store.output_path(&pid, &oid);
+        if let Some(parent) = output_path.parent() { let _ = fs::create_dir_all(parent); }
+        let _ = fs::write(&output_path, &cleaned);
+        let _ = process_store.update(&pid, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == oid) {
+                o.status = ProcessRecordStatus::Ready;
+                o.last_error = None;
+                o.metadata["progress_current"] = serde_json::json!(1);
+                o.metadata["progress_total"] = serde_json::json!(1);
+                o.metadata["progress_label"] = serde_json::json!("complete");
+                o.updated_at = ProcessRecord::now_iso();
+            }
+        });
+        yield Ok::<Event, Infallible>(
+            Event::default().event("done").data(serde_json::json!({
+                "status": "succeeded",
+                "path": output_path.to_string_lossy(),
+                "generated_chars": cleaned.chars().count(),
+            }).to_string())
+        );
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 async fn run_process_outputs(
     process_id: &str,
     source_ids: &[String],
@@ -3761,6 +4245,7 @@ async fn run_process_outputs(
     source_store: &SourceStore,
     job_id: &str,
 ) {
+    // 1) Note Patch outputs if requested.
     let note_patch_outputs: Vec<ProcessOutput> = outputs
         .iter()
         .filter(|o| o.kind == ProcessOutputKind::NotePatch)
@@ -3778,6 +4263,25 @@ async fn run_process_outputs(
         .await;
     }
 
+    // 2) Reference Digest outputs.
+    let reference_digest_outputs: Vec<ProcessOutput> = outputs
+        .iter()
+        .filter(|o| o.kind == ProcessOutputKind::ReferenceDigest)
+        .cloned()
+        .collect();
+    if !reference_digest_outputs.is_empty() {
+        run_reference_digest_outputs(
+            process_id,
+            source_ids,
+            &reference_digest_outputs,
+            process_store,
+            source_store,
+            job_id,
+        )
+        .await;
+    }
+
+    // 3) Cheating Sheet outputs.
     let cheating_sheet_outputs: Vec<ProcessOutput> = outputs
         .iter()
         .filter(|o| o.kind == ProcessOutputKind::CheatingSheet)
@@ -3787,6 +4291,43 @@ async fn run_process_outputs(
         run_cheating_sheet_outputs(process_id, &cheating_sheet_outputs, process_store, job_id)
             .await;
     }
+}
+
+/// Build shared Note Patch prompts (used by both streaming and non-streaming paths).
+fn build_note_patch_prompts(
+    has_base_note: bool,
+    context: &str,
+    context_limit: usize,
+) -> (String, String) {
+    let system_prompt = if has_base_note {
+        "You are an expert note editor. You are given an existing Markdown note and supplementary source materials (lecture transcripts, etc.). \
+         Your job is to produce a COMPLETE updated Markdown note that incorporates key information from the sources into the existing note. \
+         Make only the SMALLEST necessary modifications -- preserve the existing structure, wording, and formatting wherever possible. \
+         Add missing details, correct factual errors, and supplement with important information from the sources. \
+         Return ONLY the complete updated Markdown note, with no surrounding explanation, no code fences, and no commentary. \
+         The output MUST be valid Markdown and MUST be the full note, not just the changes."
+    } else {
+        "You are an expert note writer. You are given lecture transcript materials and you need to generate a well-structured Markdown note. \
+         Organize the content logically: group related topics, use headings (## for sections, ### for sub-sections), \
+         include bullet points for key facts, and preserve timestamps in [MM:SS] format when citing specific moments. \
+         Be comprehensive but well-organized. Do not invent facts not present in the sources. \
+         Return ONLY the generated Markdown note, with no surrounding explanation, no code fences, and no commentary. \
+         The output MUST be valid Markdown."
+    };
+
+    let user_prompt = if has_base_note {
+        format!(
+            "Update the existing note with information from the following source materials:\n\n{}\n\nRemember: return ONLY the complete updated Markdown note, no explanation or code fences.",
+            truncate_for_llm(context, context_limit)
+        )
+    } else {
+        format!(
+            "Generate a note from the following source materials:\n\n{}\n\nRemember: return ONLY the Markdown note, no explanation or code fences.",
+            truncate_for_llm(context, context_limit)
+        )
+    };
+
+    (system_prompt.to_string(), user_prompt)
 }
 
 /// Run the Note Patch generation for a set of outputs.
@@ -3917,64 +4458,46 @@ async fn run_note_patch(
     };
 
     // Build LLM prompt.
-    let system_prompt = if base_note_content.is_some() {
-        "You are an expert note editor. You are given an existing Markdown note and supplementary source materials (lecture transcripts, etc.). \
-         Your job is to produce a COMPLETE updated Markdown note that incorporates key information from the sources into the existing note. \
-         Make only the SMALLEST necessary modifications -- preserve the existing structure, wording, and formatting wherever possible. \
-         Add missing details, correct factual errors, and supplement with important information from the sources. \
-         Return ONLY the complete updated Markdown note, with no surrounding explanation, no code fences, and no commentary. \
-         The output MUST be valid Markdown and MUST be the full note, not just the changes."
-    } else {
-        "You are an expert note writer. You are given lecture transcript materials and you need to generate a well-structured Markdown note. \
-         Organize the content logically: group related topics, use headings (## for sections, ### for sub-sections), \
-         include bullet points for key facts, and preserve timestamps in [MM:SS] format when citing specific moments. \
-         Be comprehensive but well-organized. Do not invent facts not present in the sources. \
-         Return ONLY the generated Markdown note, with no surrounding explanation, no code fences, and no commentary. \
-         The output MUST be valid Markdown."
-    };
-
-    let user_prompt = format!(
-        "Generate a note from the following source materials:\n\n{}\n\nRemember: return ONLY the Markdown note, no explanation or code fences.",
-        truncate_for_llm(&context, context_limit)
-    );
+    let (system_prompt, user_prompt) =
+        build_note_patch_prompts(base_note_content.is_some(), &context, context_limit);
     update_note_patch_progress(process_store, process_id, outputs, 1, 3, "calling LLM");
 
     // Call LLM.
-    let markdown_output = match crate::llm::chat_text(system_prompt, &user_prompt, 0.3, 16384).await
-    {
-        Ok(text) => {
-            // Strip code fences if the LLM wrapped it anyway.
-            let cleaned = text.trim();
-            let cleaned = if cleaned.starts_with("```markdown") {
-                cleaned
-                    .strip_prefix("```markdown")
-                    .and_then(|s| s.strip_suffix("```"))
-                    .map(|s| s.trim())
-                    .unwrap_or(cleaned)
-            } else if cleaned.starts_with("```") {
-                cleaned
-                    .strip_prefix("```")
-                    .and_then(|s| s.strip_suffix("```"))
-                    .map(|s| s.trim())
-                    .unwrap_or(cleaned)
-            } else {
-                cleaned
-            };
-            cleaned.to_string()
-        }
-        Err(e) => {
-            let err_msg = format!("LLM call failed: {}", e);
-            for output in outputs {
-                let _ = process_store.update(process_id, |r| {
-                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
-                        o.status = ProcessRecordStatus::Failed;
-                        o.last_error = Some(err_msg.clone());
-                    }
-                });
+    let markdown_output =
+        match crate::llm::chat_text(&system_prompt, &user_prompt, 0.3, 32768).await {
+            Ok(text) => {
+                // Strip code fences if the LLM wrapped it anyway.
+                let cleaned = text.trim();
+                let cleaned = if cleaned.starts_with("```markdown") {
+                    cleaned
+                        .strip_prefix("```markdown")
+                        .and_then(|s| s.strip_suffix("```"))
+                        .map(|s| s.trim())
+                        .unwrap_or(cleaned)
+                } else if cleaned.starts_with("```") {
+                    cleaned
+                        .strip_prefix("```")
+                        .and_then(|s| s.strip_suffix("```"))
+                        .map(|s| s.trim())
+                        .unwrap_or(cleaned)
+                } else {
+                    cleaned
+                };
+                cleaned.to_string()
             }
-            return;
-        }
-    };
+            Err(e) => {
+                let err_msg = format!("LLM call failed: {}", e);
+                for output in outputs {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(err_msg.clone());
+                        }
+                    });
+                }
+                return;
+            }
+        };
 
     // Save output and diff for each output record.
     for output in outputs {
@@ -4024,6 +4547,937 @@ async fn run_note_patch(
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reference Digest generation
+// ---------------------------------------------------------------------------
+
+/// Run Reference Digest generation for a set of outputs.
+///
+/// Loads current process Sources (optional Note, TranscriptDay list,
+/// TranscriptCourse list).  Does **not** inspect process.outputs for Note Patch
+/// and does **not** read Note Patch files.
+async fn run_reference_digest_outputs(
+    process_id: &str,
+    source_ids: &[String],
+    outputs: &[ProcessOutput],
+    process_store: &ProcessStore,
+    source_store: &SourceStore,
+    job_id: &str,
+) {
+    let sources = source_store.load_all();
+
+    let note_source: Option<&SourceRecord> = sources
+        .iter()
+        .find(|s| source_ids.contains(&s.id) && s.kind == SourceKind::Note);
+    let transcript_sources: Vec<&SourceRecord> = sources
+        .iter()
+        .filter(|s| source_ids.contains(&s.id) && s.kind == SourceKind::TranscriptDay)
+        .collect();
+    let course_sources: Vec<&SourceRecord> = sources
+        .iter()
+        .filter(|s| source_ids.contains(&s.id) && s.kind == SourceKind::TranscriptCourse)
+        .collect();
+
+    if transcript_sources.is_empty() && course_sources.is_empty() && note_source.is_none() {
+        for output in outputs {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some("No valid sources found for Reference Digest.".to_string());
+                }
+            });
+        }
+        return;
+    }
+
+    if !crate::llm::is_available() {
+        let err_msg = "LLM is not available. Set OPENAI_API_KEY in Settings to enable Reference Digest generation.".to_string();
+        for output in outputs {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.clone());
+                }
+            });
+        }
+        return;
+    }
+
+    // Dispatch to course path when course sources are present.
+    if !course_sources.is_empty() {
+        run_course_reference_digest(
+            process_id,
+            note_source,
+            &course_sources,
+            outputs,
+            process_store,
+            job_id,
+        )
+        .await;
+        return;
+    }
+
+    // -------------------------------------------------------------------
+    // Ordinary Note + TranscriptDay sources path
+    // -------------------------------------------------------------------
+    update_ref_digest_progress(
+        process_store,
+        process_id,
+        outputs,
+        0,
+        2,
+        "building transcript context",
+    );
+
+    // Read Note source as structure/priority/style reference (up to 50000 chars).
+    let note_content: Option<String> = if let Some(note) = note_source {
+        match fs::read_to_string(&note.path) {
+            Ok(content) => {
+                let truncated: String = content.chars().take(50000).collect();
+                Some(truncated)
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} reference-digest: failed to read note source {}: {}",
+                    job_id, note.path, e
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build compact transcript context (target 100000 chars), sharing budget
+    // across sources so later transcript files are not dropped.
+    let mut context = String::new();
+    let context_limit: usize = 100000;
+    let per_source_budget = if transcript_sources.is_empty() {
+        0
+    } else {
+        context_limit / transcript_sources.len()
+    };
+
+    for src in &transcript_sources {
+        match fs::read_to_string(&src.path) {
+            Ok(content) => {
+                let compact = crate::llm::compact_transcript_for_llm(&content, per_source_budget);
+                context.push_str(&format!(
+                    "\n\n--- Source: {} (type: {}) ---\n",
+                    src.title,
+                    src.kind.to_string()
+                ));
+                context.push_str(&compact);
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} reference-digest: failed to read source {}: {}",
+                    job_id, src.path, e
+                ));
+            }
+        }
+    }
+
+    let combined_chars = context.chars().count();
+    let fits_in_one_call = combined_chars <= context_limit && transcript_sources.len() <= 2;
+
+    let digest_markdown = if fits_in_one_call {
+        update_ref_digest_progress(
+            process_store,
+            process_id,
+            outputs,
+            1,
+            2,
+            "generating digest",
+        );
+        match generate_ref_digest_single(&note_content, &context).await {
+            Ok(md) => md,
+            Err(e) => {
+                let err_msg = format!("Reference Digest generation failed: {}", e);
+                for output in outputs {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(err_msg.clone());
+                        }
+                    });
+                }
+                return;
+            }
+        }
+    } else {
+        // Generate per-source section digests, then merge.
+        update_ref_digest_progress(
+            process_store,
+            process_id,
+            outputs,
+            1,
+            2,
+            "generating section digests",
+        );
+        let mut section_digests: Vec<String> = Vec::new();
+        for src in &transcript_sources {
+            let src_content = match fs::read_to_string(&src.path) {
+                Ok(c) => c,
+                Err(e) => {
+                    web_log(format!(
+                        "job {} reference-digest: failed to read source {}: {}",
+                        job_id, src.path, e
+                    ));
+                    continue;
+                }
+            };
+            let compact = crate::llm::compact_transcript_for_llm(&src_content, 90000);
+            let src_context = format!(
+                "Source: {} (type: {})\n{}",
+                src.title,
+                src.kind.to_string(),
+                compact
+            );
+            match generate_ref_digest_section(&note_content, &src_context).await {
+                Ok(md) => section_digests.push(md),
+                Err(e) => {
+                    web_log(format!(
+                        "job {} reference-digest: section digest for {} failed: {}",
+                        job_id, src.title, e
+                    ));
+                }
+            }
+        }
+        if section_digests.is_empty() {
+            let err_msg = "All section digest generations failed.".to_string();
+            for output in outputs {
+                let _ = process_store.update(process_id, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                        o.status = ProcessRecordStatus::Failed;
+                        o.last_error = Some(err_msg.clone());
+                    }
+                });
+            }
+            return;
+        }
+        match merge_ref_digest_sections(&section_digests).await {
+            Ok(md) => md,
+            Err(e) => {
+                let err_msg = format!("Reference Digest merge failed: {}", e);
+                for output in outputs {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(err_msg.clone());
+                        }
+                    });
+                }
+                return;
+            }
+        }
+    };
+
+    // Write output for each record.
+    let source_counts = serde_json::json!({
+        "note": note_source.is_some(),
+        "transcript_day": transcript_sources.len(),
+        "transcript_course": course_sources.len(),
+    });
+    let generated_chars = digest_markdown.chars().count();
+
+    for output in outputs {
+        let output_path = process_store.output_path(process_id, &output.id);
+        if let Some(parent) = output_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&output_path, &digest_markdown) {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Failed to write output: {}", e));
+                }
+            });
+            continue;
+        }
+
+        let _ = process_store.update(process_id, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                o.status = ProcessRecordStatus::Ready;
+                o.base_source_id = note_source.map(|n| n.id.clone());
+                o.last_error = None;
+                o.metadata = serde_json::json!({
+                    "progress_current": 2,
+                    "progress_total": 2,
+                    "progress_label": "complete",
+                    "source_note_used": note_source.is_some(),
+                    "source_counts": source_counts,
+                    "generated_chars": generated_chars,
+                });
+                o.updated_at = ProcessRecord::now_iso();
+            }
+        });
+    }
+}
+
+/// Generate a single-pass Reference Digest from combined transcript context.
+async fn generate_ref_digest_single(
+    note_content: &Option<String>,
+    transcript_context: &str,
+) -> Result<String> {
+    let system = build_ref_digest_system_prompt();
+    let user = build_ref_digest_user_prompt(note_content, transcript_context, None);
+    let text = crate::llm::chat_text(&system, &user, 0.25, 81920).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Generate a Reference Digest section for a single transcript source.
+async fn generate_ref_digest_section(
+    note_content: &Option<String>,
+    src_context: &str,
+) -> Result<String> {
+    let system = build_ref_digest_system_prompt();
+    let user = build_ref_digest_user_prompt(note_content, src_context, Some("section"));
+    let text = crate::llm::chat_text(&system, &user, 0.25, 32768).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Merge independently-generated Reference Digest sections into one cohesive digest.
+async fn merge_ref_digest_sections(sections: &[String]) -> Result<String> {
+    let combined = sections
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("<!-- digest section {} -->\n{}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let truncated: String = combined.chars().take(160000).collect();
+
+    let system = "\
+You are an editor merging Reference Digest sections into one cohesive, detailed Markdown document.\n\
+Normalize: heading hierarchy (## for top sections, ### for subsections), terminology consistency, \
+formula formatting, remove duplicate content, and add smooth transitions between sections.\n\
+Do not add new facts - only reorganize and normalize the provided content.\n\
+Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers.";
+
+    let user = format!(
+        "Merge and normalize these Reference Digest sections into one complete Markdown document:\n\n{}\n\nReturn only Markdown.",
+        truncated
+    );
+
+    let text = crate::llm::chat_text(system, &user, 0.2, 81920).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Build the system prompt for Reference Digest generation.
+fn build_ref_digest_system_prompt() -> String {
+    "\
+You are a lecture digest writer. Create a detailed, structured Markdown Reference Digest from \
+lecture transcripts. The digest will be used downstream to compress into an exam cheat sheet, \
+so be comprehensive and precise.\n\n\
+Goal: detailed, structured Markdown covering definitions, formulas, conditions, algorithms, \
+steps, comparisons, pitfalls, exam judgement rules, and timestamp evidence.\n\n\
+Default language: Chinese, preserving English technical terms, identifiers, symbols, and formulas.\n\
+Use ## for top-level sections and ### for subsections.\n\
+Do not invent facts beyond the supplied sources.\n\
+Include [MM:SS] timestamps when referencing specific moments.\n\
+Return ONLY Markdown, no code fences, no explanations.".to_string()
+}
+
+/// Build the user prompt for Reference Digest generation.
+fn build_ref_digest_user_prompt(
+    note_content: &Option<String>,
+    transcript_context: &str,
+    _mode: Option<&str>,
+) -> String {
+    let mut user = String::new();
+
+    if let Some(ref note) = note_content {
+        user.push_str(&format!(
+            "Reference Note (structure / priority / style reference only; not a length constraint):\n\n{}\n\n---\n\n",
+            truncate_for_llm(note, 50000)
+        ));
+    }
+
+    user.push_str(&format!(
+        "Transcript sources:\n\n{}\n\n---\n\n\
+        Create a comprehensive Reference Digest Markdown document. \
+        Prioritize: definitions, formulas, conditions, algorithms, steps, comparisons, \
+        pitfalls, exam judgement rules, and timestamp evidence. \
+        Be detailed and precise - this will be further compressed into an exam cheat sheet. \
+        Return ONLY Markdown.",
+        transcript_context
+    ));
+
+    user
+}
+
+/// Course-based Reference Digest generation using staged outline -> section -> merge pipeline.
+async fn run_course_reference_digest(
+    process_id: &str,
+    note_source: Option<&SourceRecord>,
+    course_sources: &[&SourceRecord],
+    outputs: &[ProcessOutput],
+    process_store: &ProcessStore,
+    job_id: &str,
+) {
+    // Helper: mark every output as failed.
+    fn fail_rd_outputs(
+        process_store: &ProcessStore,
+        process_id: &str,
+        outputs: &[ProcessOutput],
+        err_msg: &str,
+    ) {
+        for output in outputs {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.to_string());
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+        }
+    }
+
+    // Step 1 - Load course index.
+    update_ref_digest_progress(
+        process_store,
+        process_id,
+        outputs,
+        0,
+        4,
+        "loading course index",
+    );
+
+    let mut indexes: Vec<CourseDateIndex> = Vec::new();
+    for source in course_sources {
+        match read_manifest(&source.path) {
+            Ok(manifest) => indexes.extend(read_indexes(&manifest)),
+            Err(e) => {
+                web_log(format!(
+                    "job {} reference-digest: failed to read course manifest {}: {}",
+                    job_id, source.path, e
+                ));
+            }
+        }
+    }
+    if indexes.is_empty() {
+        fail_rd_outputs(
+            process_store,
+            process_id,
+            outputs,
+            "No ready Course Transcript indexes found.",
+        );
+        return;
+    }
+
+    if !crate::llm::is_available() {
+        fail_rd_outputs(
+            process_store,
+            process_id,
+            outputs,
+            "LLM is not available. Set OPENAI_API_KEY in Settings to enable Reference Digest generation.",
+        );
+        return;
+    }
+
+    // Step 2 - Plan outline from index metadata + optional note structure.
+    update_ref_digest_progress(
+        process_store,
+        process_id,
+        outputs,
+        1,
+        4,
+        "planning digest outline",
+    );
+
+    // Build optional note heading inventory for richer outline context.
+    let note_heading_inventory = if let Some(note) = note_source {
+        match fs::read_to_string(&note.path) {
+            Ok(content) => {
+                let headings = crate::notes::extract_headings(&content);
+                if headings.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nExisting note heading inventory:\n{}",
+                        headings.join("\n- ")
+                    )
+                }
+            }
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    let (planned_sections, outline_fallback_used, outline_fallback_reason) =
+        match generate_course_ref_digest_outline(&indexes, &note_heading_inventory).await {
+            Ok(s) => (s, false, None),
+            Err(e) => {
+                let llm_error = e.to_string();
+                match generate_fallback_outline(&indexes) {
+                    Ok(sections) => {
+                        web_log(format!(
+                            "job {} reference-digest: using fallback outline ({} sections) after LLM outline failed: {}",
+                            job_id, sections.len(), llm_error
+                        ));
+                        (sections, true, Some(llm_error))
+                    }
+                    Err(fallback_err) => {
+                        let err_msg = format!(
+                            "Failed to generate Reference Digest outline: {}. Fallback also failed: {}",
+                            llm_error, fallback_err
+                        );
+                        fail_rd_outputs(process_store, process_id, outputs, &err_msg);
+                        return;
+                    }
+                }
+            }
+        };
+
+    let total_sections = planned_sections.len();
+    let total_steps = total_sections + 3; // loading + outline + N sections + merge
+
+    // Step 3 - Generate each section independently.
+    let style_guide = "Write detailed Reference Digest sections. Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers. Include definitions, formulas, conditions, algorithms, steps, comparisons, pitfalls, exam judgement rules, and timestamp evidence.";
+
+    let mut generated_sections: Vec<String> = Vec::new();
+    let mut retrieval_traces: Vec<RetrievalTrace> = Vec::new();
+    let mut success_count: usize = 0;
+
+    for (i, section) in planned_sections.iter().enumerate() {
+        let label = format!("generating digest section {}/{}", i + 1, total_sections);
+        update_ref_digest_progress(
+            process_store,
+            process_id,
+            outputs,
+            2 + i,
+            total_steps,
+            &label,
+        );
+
+        let (context, trace) = retrieve_course_context_for_section_ref_digest(section, &indexes);
+        retrieval_traces.push(trace);
+
+        match generate_course_ref_digest_section(section, &context, style_guide).await {
+            Ok(markdown) => {
+                generated_sections.push(markdown);
+                success_count += 1;
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} reference-digest: section '{}' generation failed: {}",
+                    job_id, section.title, e
+                ));
+                let err_msg = format!(
+                    "Section '{}' generation failed: {}. {}/{} sections succeeded.",
+                    section.title, e, success_count, total_sections
+                );
+                fail_rd_outputs(process_store, process_id, outputs, &err_msg);
+                return;
+            }
+        }
+    }
+
+    // Step 4 - Merge sections into one cohesive Reference Digest.
+    update_ref_digest_progress(
+        process_store,
+        process_id,
+        outputs,
+        1 + total_sections,
+        total_steps,
+        "merging digest sections",
+    );
+
+    let digest_markdown =
+        match merge_course_ref_digest_sections(&generated_sections, style_guide).await {
+            Ok(md) => md,
+            Err(e) => {
+                let err_msg = format!("Failed to merge Reference Digest sections: {}", e);
+                fail_rd_outputs(process_store, process_id, outputs, &err_msg);
+                return;
+            }
+        };
+
+    // Step 5 - Write outputs.
+    update_ref_digest_progress(
+        process_store,
+        process_id,
+        outputs,
+        total_steps,
+        total_steps,
+        "complete",
+    );
+
+    let generated_chars = digest_markdown.chars().count();
+    let source_counts = serde_json::json!({
+        "note": note_source.is_some(),
+        "transcript_day": 0,
+        "transcript_course": course_sources.len(),
+    });
+
+    for output in outputs {
+        let output_path = process_store.output_path(process_id, &output.id);
+        if let Some(parent) = output_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&output_path, &digest_markdown) {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Failed to write output: {}", e));
+                }
+            });
+            continue;
+        }
+
+        let retrieval_path = process_store
+            .process_dir(process_id)
+            .join(format!("{}.retrieval.json", output.id));
+        let _ = fs::write(
+            &retrieval_path,
+            serde_json::to_string_pretty(&retrieval_traces).unwrap_or_default(),
+        );
+
+        let _ = process_store.update(process_id, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                o.status = ProcessRecordStatus::Ready;
+                o.base_source_id = note_source.map(|n| n.id.clone());
+                o.last_error = None;
+                let mut meta = serde_json::json!({
+                    "progress_current": total_steps,
+                    "progress_total": total_steps,
+                    "progress_label": "complete",
+                    "source_note_used": note_source.is_some(),
+                    "source_counts": source_counts,
+                    "generated_chars": generated_chars,
+                    "section_count": total_sections,
+                    "outline_fallback_used": outline_fallback_used,
+                });
+                if let Some(ref reason) = outline_fallback_reason {
+                    meta["outline_fallback_reason"] = serde_json::json!(reason);
+                }
+                o.metadata = meta;
+                o.updated_at = ProcessRecord::now_iso();
+            }
+        });
+    }
+}
+
+/// Generate a course Reference Digest outline from index metadata + optional note structure.
+async fn generate_course_ref_digest_outline(
+    indexes: &[CourseDateIndex],
+    note_heading_inventory: &str,
+) -> Result<Vec<PlannedSection>> {
+    let context = build_outline_context(indexes);
+
+    let system = "\
+You are a curriculum designer. Given course lecture index data, plan a structured Reference Digest outline.\n\
+\n\
+Output **only** a JSON object with this exact shape:\n\
+{\"sections\":[{\"title\":\"\",\"purpose\":\"\",\"date_hints\":[],\"video_hints\":[],\"query_terms\":[],\"must_include\":[]}]}\n\
+\n\
+Rules:\n\
+- Produce 4-24 main sections. Choose the count based on the course span and topic diversity.\n\
+- title: concise section heading (no body prose, no Markdown).\n\
+- purpose: one short sentence describing what this section should cover in the Reference Digest.\n\
+- date_hints: date substrings that help select relevant lecture days (max 5 items).\n\
+- video_hints: video ID substrings from the range previews (max 5 items).\n\
+- query_terms: search keywords for retrieval (max 5 items).\n\
+- must_include: key concepts / formulas / definitions that must appear (max 5 items).\n\
+\n\
+All arrays max 5 items. No body prose, no Markdown, no explanations outside the JSON.\n\
+Organize by topic, not by date. Each section should cover a coherent topic that may span multiple lecture days.";
+
+    let user = format!(
+        "Course lecture index data:\n{}\n{}Plan a Reference Digest outline with sections organized by topic. Return only the JSON object described above.",
+        truncate_for_llm(&context, 32000),
+        if note_heading_inventory.is_empty() {
+            String::new()
+        } else {
+            format!("\nNote heading inventory for reference:\n{}\n\n", note_heading_inventory)
+        }
+    );
+
+    let messages = vec![
+        crate::llm::ChatMessage {
+            role: "system".into(),
+            content: system.to_string(),
+        },
+        crate::llm::ChatMessage {
+            role: "user".into(),
+            content: user.clone(),
+        },
+    ];
+
+    // First attempt: max_tokens = 49152.
+    let (text, finish_reason) =
+        crate::llm::chat_completion_with_metadata(&messages, 0.2, 49152, Some("json_object"))
+            .await
+            .context("Reference Digest outline LLM call failed")?;
+
+    match parse_outline_sections(&text, finish_reason.as_deref()) {
+        Ok(sections) if (4..=24).contains(&sections.len()) => return Ok(sections),
+        Ok(sections) => {
+            let diagnostic = format!(
+                "Outline had {} section(s), expected 4-24. response_len={}",
+                sections.len(),
+                text.chars().count()
+            );
+            web_log(format!("Reference Digest outline retry: {}", diagnostic));
+        }
+        Err(diagnostic) => {
+            web_log(format!(
+                "Reference Digest outline parse failure: {}",
+                diagnostic
+            ));
+        }
+    }
+
+    // Retry: max_tokens = 57344.
+    let retry_user = {
+        let char_count = text.chars().count();
+        let head: String = text.chars().take(300).collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!(
+            "The previous outline attempt produced invalid or unusable JSON.\n\
+             Diagnostic: response_len={} finish_reason={:?}\n\
+             Head snippet: {}\n\
+             Tail snippet: {}\n\n\
+             Original course index context:\n{}\n{}\n\
+             Plan a Reference Digest outline with 4-24 sections organized by topic. Return only the JSON object.",
+            char_count, finish_reason, head, tail,
+            truncate_for_llm(&context, 28000),
+            if note_heading_inventory.is_empty() {
+                String::new()
+            } else {
+                format!("\nNote heading inventory:\n{}\n", note_heading_inventory)
+            }
+        )
+    };
+
+    let retry_messages = vec![
+        crate::llm::ChatMessage {
+            role: "system".into(),
+            content: system.to_string(),
+        },
+        crate::llm::ChatMessage {
+            role: "user".into(),
+            content: retry_user,
+        },
+    ];
+
+    let (retry_text, retry_finish_reason) =
+        crate::llm::chat_completion_with_metadata(&retry_messages, 0.2, 57344, Some("json_object"))
+            .await
+            .context("Reference Digest outline retry LLM call failed")?;
+
+    match parse_outline_sections(&retry_text, retry_finish_reason.as_deref()) {
+        Ok(sections) if (4..=24).contains(&sections.len()) => Ok(sections),
+        Ok(sections) => {
+            anyhow::bail!(
+                "Reference Digest outline retry produced {} section(s), expected 4-24",
+                sections.len()
+            );
+        }
+        Err(diagnostic) => {
+            anyhow::bail!(
+                "Reference Digest outline retry parse failed: {}",
+                diagnostic
+            );
+        }
+    }
+}
+
+/// Retrieve compact transcript context for a planned Reference Digest section.
+///
+/// Uses a 32000 char per-section context cap (wider than Note Patch).
+fn retrieve_course_context_for_section_ref_digest(
+    section: &PlannedSection,
+    indexes: &[CourseDateIndex],
+) -> (String, RetrievalTrace) {
+    let max_indexes: usize = 4;
+    let context_budget: usize = 32000;
+    let mut trace_matches = Vec::new();
+    let mut selected: Vec<(&CourseDateIndex, f64)> = Vec::new();
+
+    // 1) Date-hint match.
+    if !section.date_hints.is_empty() {
+        for index in indexes {
+            if selected.len() >= max_indexes {
+                break;
+            }
+            let date_matches = section.date_hints.iter().any(|hint| {
+                index.date.contains(hint.as_str()) || hint.contains(index.date.as_str())
+            });
+            if date_matches {
+                selected.push((index, 1.0));
+            }
+        }
+    }
+
+    // 2) Fallback to BM25.
+    if selected.is_empty() {
+        let query = format!(
+            "{} {} {} {}",
+            section.title,
+            section.purpose,
+            section.query_terms.join(" "),
+            section.must_include.join(" ")
+        );
+        let hits = bm25_search(indexes, &query, max_indexes);
+        for hit in hits {
+            selected.push((hit.index, hit.score));
+        }
+    }
+
+    let mut context = String::new();
+    for (index, score) in &selected {
+        let ranges = index
+            .timestamp_ranges
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<TimestampRange>>();
+        trace_matches.push(RetrievalMatch {
+            date: index.date.clone(),
+            score: *score,
+            timestamp_ranges: ranges.clone(),
+        });
+
+        let remaining = context_budget.saturating_sub(context.chars().count());
+        if remaining < 500 {
+            break;
+        }
+        let source_text = fs::read_to_string(&index.source_path).unwrap_or_default();
+        let transcript_budget = remaining.min(12000);
+        context.push_str(&format!(
+            "\n\n--- Date: {} | {} ---\nSummary: {}\nKeywords: {}\nConcepts: {}\nRanges:\n{}\nTranscript excerpt:\n{}",
+            index.date,
+            index.title,
+            index.summary,
+            index.keywords.join(", "),
+            index.concepts.join(", "),
+            ranges
+                .iter()
+                .map(|r| format!(
+                    "{} [{:.0}-{:.0}] {}",
+                    r.video_id, r.start, r.end, r.text_preview
+                ))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            compact_transcript_for_llm(&source_text, transcript_budget)
+        ));
+    }
+
+    let trace = RetrievalTrace {
+        section: section.title.clone(),
+        matches: trace_matches,
+        skipped_reason: if selected.is_empty() {
+            Some("no relevant indexes found for section".to_string())
+        } else {
+            None
+        },
+    };
+
+    (context, trace)
+}
+
+/// Generate Markdown for a single planned Reference Digest section.
+async fn generate_course_ref_digest_section(
+    section: &PlannedSection,
+    context: &str,
+    style_guide: &str,
+) -> Result<String> {
+    let system = format!(
+        "You are a Reference Digest writer. Write a detailed Markdown section.\n\
+        Section title: {}\nPurpose: {}\n\
+        Use ## {} for the section heading and ### for subsections.\n\
+        Write detailed Reference Digest content - include definitions, formulas, conditions, \
+        algorithms, steps, comparisons, pitfalls, exam judgement rules, and timestamp evidence.\n\
+        Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers.\n\
+        Must include these concepts: {}\n\
+        Do not invent facts beyond the provided context.\n\
+        {}",
+        section.title,
+        section.purpose,
+        section.title,
+        section.must_include.join(", "),
+        style_guide
+    );
+
+    let user = format!(
+        "Write the Reference Digest Markdown section. Context:\n{}",
+        truncate_for_llm(context, 32000)
+    );
+
+    let text = crate::llm::chat_text(&system, &user, 0.25, 24576).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Merge independently-generated Reference Digest sections into one cohesive digest.
+async fn merge_course_ref_digest_sections(
+    sections: &[String],
+    style_guide: &str,
+) -> Result<String> {
+    let combined = sections
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("<!-- section {} -->\n{}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let truncated: String = combined.chars().take(160000).collect();
+
+    let system = format!(
+        "You are an editor normalizing Reference Digest sections into one cohesive Markdown document.\n\
+        Normalize: title hierarchy (## for top sections, ### for subsections), terminology consistency, \
+        formula formatting, duplicate content removal, and smooth transitions between sections.\n\
+        Do not add new facts - only reorganize and normalize the provided content.\n\
+        Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers.\n\
+        {}",
+        style_guide
+    );
+
+    let user = format!(
+        "Merge and normalize these Reference Digest sections into one complete Markdown document:\n\n{}\n\nReturn only Markdown.",
+        truncated
+    );
+
+    let text = crate::llm::chat_text(&system, &user, 0.2, 81920).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Update progress for Reference Digest outputs.
+fn update_ref_digest_progress(
+    process_store: &ProcessStore,
+    process_id: &str,
+    outputs: &[ProcessOutput],
+    current: usize,
+    total: usize,
+    label: &str,
+) {
+    let output_ids: Vec<String> = outputs.iter().map(|o| o.id.clone()).collect();
+    let current = current.min(total);
+    let total = total.max(1);
+    let label = label.to_string();
+    let _ = process_store.update(process_id, |r| {
+        for output in &mut r.outputs {
+            if output_ids.contains(&output.id) {
+                output.metadata = serde_json::json!({
+                    "progress_current": current,
+                    "progress_total": total,
+                    "progress_label": label,
+                });
+                output.updated_at = ProcessRecord::now_iso();
+            }
+        }
+    });
 }
 
 async fn run_course_note_patch(
@@ -4321,10 +5775,7 @@ fn parse_outline_sections(
     let json: serde_json::Value = match serde_json::from_str(&cleaned) {
         Ok(v) => v,
         Err(e) => {
-            let mut diag = format!(
-                "JSON parse error: {}. response_len={}",
-                e, char_count
-            );
+            let mut diag = format!("JSON parse error: {}. response_len={}", e, char_count);
             if let Some("length") = finish_reason {
                 diag.push_str(" [truncated_by_length]");
             }
@@ -4405,8 +5856,7 @@ fn generate_fallback_outline(indexes: &[CourseDateIndex]) -> Result<Vec<PlannedS
 
     let n = indexes.len();
     // 4-24 sections when enough indexes exist; fewer otherwise, but ≥ 1.
-    let section_count = ((n as f64).sqrt().ceil() as usize)
-        .clamp(if n >= 4 { 4 } else { 1 }, 24);
+    let section_count = ((n as f64).sqrt().ceil() as usize).clamp(if n >= 4 { 4 } else { 1 }, 24);
 
     let chunk_size = ((n as f64) / (section_count as f64)).ceil() as usize;
 
@@ -4501,9 +5951,7 @@ fn generate_fallback_outline(indexes: &[CourseDateIndex]) -> Result<Vec<PlannedS
     Ok(sections)
 }
 
-async fn generate_course_note_outline(
-    indexes: &[CourseDateIndex],
-) -> Result<Vec<PlannedSection>> {
+async fn generate_course_note_outline(indexes: &[CourseDateIndex]) -> Result<Vec<PlannedSection>> {
     let context = build_outline_context(indexes);
 
     let system = "\
@@ -4526,7 +5974,7 @@ Organize by topic, not by date. Each section should cover a coherent topic that 
 
     let user = format!(
         "Course lecture index data:\n{}\n\nPlan a note outline with sections organized by topic. Return only the JSON object described above.",
-        truncate_for_llm(&context, 24000)
+        truncate_for_llm(&context, 32000)
     );
 
     let messages = vec![
@@ -4540,15 +5988,11 @@ Organize by topic, not by date. Each section should cover a coherent topic that 
         },
     ];
 
-    // --- First attempt: max_tokens = 32768, temperature = 0.2 ---
-    let (text, finish_reason) = crate::llm::chat_completion_with_metadata(
-        &messages,
-        0.2,
-        32768,
-        Some("json_object"),
-    )
-    .await
-    .context("Outline LLM call failed")?;
+    // --- First attempt: max_tokens = 49152, temperature = 0.2 ---
+    let (text, finish_reason) =
+        crate::llm::chat_completion_with_metadata(&messages, 0.2, 49152, Some("json_object"))
+            .await
+            .context("Outline LLM call failed")?;
 
     match parse_outline_sections(&text, finish_reason.as_deref()) {
         Ok(sections) if (4..=24).contains(&sections.len()) => return Ok(sections),
@@ -4566,7 +6010,7 @@ Organize by topic, not by date. Each section should cover a coherent topic that 
         }
     }
 
-    // --- Retry: max_tokens = 49152, include diagnostic in user prompt ---
+    // --- Retry: max_tokens = 57344, include diagnostic in user prompt ---
     // The retry does NOT append the invalid output as an assistant message.
     // It starts a fresh conversation with the diagnostic embedded in the user
     // prompt.
@@ -4589,7 +6033,7 @@ Organize by topic, not by date. Each section should cover a coherent topic that 
              Original course index context:\n{}\n\n\
              Plan a note outline with 4-24 sections organized by topic. Return only the JSON object.",
             char_count, finish_reason, head, tail,
-            truncate_for_llm(&context, 20000)
+            truncate_for_llm(&context, 28000)
         )
     };
 
@@ -4604,14 +6048,10 @@ Organize by topic, not by date. Each section should cover a coherent topic that 
         },
     ];
 
-    let (retry_text, retry_finish_reason) = crate::llm::chat_completion_with_metadata(
-        &retry_messages,
-        0.2,
-        49152,
-        Some("json_object"),
-    )
-    .await
-    .context("Outline retry LLM call failed")?;
+    let (retry_text, retry_finish_reason) =
+        crate::llm::chat_completion_with_metadata(&retry_messages, 0.2, 57344, Some("json_object"))
+            .await
+            .context("Outline retry LLM call failed")?;
 
     match parse_outline_sections(&retry_text, retry_finish_reason.as_deref()) {
         Ok(sections) if (4..=24).contains(&sections.len()) => Ok(sections),
@@ -4637,7 +6077,7 @@ fn retrieve_course_context_for_section(
     indexes: &[CourseDateIndex],
 ) -> (String, RetrievalTrace) {
     let max_indexes: usize = 4;
-    let context_budget: usize = 24000;
+    let context_budget: usize = 32000;
     let mut trace_matches = Vec::new();
     let mut selected: Vec<(&CourseDateIndex, f64)> = Vec::new();
 
@@ -4647,10 +6087,9 @@ fn retrieve_course_context_for_section(
             if selected.len() >= max_indexes {
                 break;
             }
-            let date_matches = section
-                .date_hints
-                .iter()
-                .any(|hint| index.date.contains(hint.as_str()) || hint.contains(index.date.as_str()));
+            let date_matches = section.date_hints.iter().any(|hint| {
+                index.date.contains(hint.as_str()) || hint.contains(index.date.as_str())
+            });
             if date_matches {
                 selected.push((index, 1.0));
             }
@@ -4751,10 +6190,10 @@ async fn generate_course_note_section(
 
     let user = format!(
         "Write the Markdown section. Context:\n{}",
-        truncate_for_llm(context, 24000)
+        truncate_for_llm(context, 32000)
     );
 
-    let text = crate::llm::chat_text(&system, &user, 0.25, 8192).await?;
+    let text = crate::llm::chat_text(&system, &user, 0.25, 16384).await?;
     Ok(strip_markdown_fences(&text))
 }
 
@@ -4763,10 +6202,7 @@ async fn generate_course_note_section(
 /// The prompt normalises title hierarchy, terminology, formula formatting,
 /// duplicate content, and transitions **without** adding new facts.  Only the
 /// section texts and style guide are fed in — raw transcripts are excluded.
-async fn merge_course_note_sections(
-    sections: &[String],
-    style_guide: &str,
-) -> Result<String> {
+async fn merge_course_note_sections(sections: &[String], style_guide: &str) -> Result<String> {
     let combined = sections
         .iter()
         .enumerate()
@@ -5078,6 +6514,238 @@ async fn run_course_note_generation(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cheating Sheet capacity estimation and section inventory
+// ---------------------------------------------------------------------------
+
+/// Budget estimates for generating a cheating sheet of `max_pages` pages.
+///
+/// The template is 4-column A4 with 5pt body text. Budget estimates:
+/// - ~11000 chars/page is a comfortable fill target.
+/// - ~13500 chars/page is the soft maximum before content overflows.
+#[derive(Debug, Clone)]
+struct CheatingSheetBudget {
+    target_chars: usize,
+    soft_max_chars: usize,
+    min_acceptable_chars: usize,
+}
+
+/// Estimate the character budget for a cheating sheet of `max_pages` pages.
+///
+/// Clamps `max_pages` to `1..=20` (matching the caller's policy).
+fn estimate_cheating_sheet_budget(max_pages: usize) -> CheatingSheetBudget {
+    let pages = max_pages.clamp(1, 20);
+    let target_chars = pages.saturating_mul(11000);
+    let soft_max_chars = pages.saturating_mul(15000);
+    let min_acceptable_chars = target_chars.saturating_mul(3) / 4;
+    CheatingSheetBudget {
+        target_chars,
+        soft_max_chars,
+        min_acceptable_chars,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown section inventory
+// ---------------------------------------------------------------------------
+
+/// A parsed section heading from source Markdown.
+#[derive(Debug, Clone)]
+struct CheatSection {
+    /// Heading level (1 for `#`, 2 for `##`, 3 for `###`).
+    level: usize,
+    /// Heading text (without the `#` prefix).
+    heading: String,
+    /// Short preview of the section body (first ~120 chars).
+    body_preview: String,
+}
+
+/// Build a compact inventory of Markdown sections for prompting.
+///
+/// Parses `#`, `##`, and `###` headings in order and captures a short body
+/// preview for each section. The result is a plain-text inventory string
+/// suitable for inclusion in an LLM prompt.
+fn build_section_inventory(markdown: &str) -> (Vec<CheatSection>, String) {
+    let heading_re = regex::Regex::new(r"^(#{1,3})\s+(.+)$").unwrap();
+    let mut sections: Vec<CheatSection> = Vec::new();
+    let mut current_body = String::new();
+
+    for line in markdown.lines() {
+        if let Some(caps) = heading_re.captures(line) {
+            // Flush the current body into the previous section, if any.
+            if let Some(last) = sections.last_mut() {
+                if last.body_preview.is_empty() {
+                    last.body_preview = truncate_chars(&current_body, 120);
+                }
+            }
+            current_body.clear();
+
+            let level = caps.get(1).unwrap().as_str().len();
+            let heading = caps.get(2).unwrap().as_str().trim().to_string();
+            sections.push(CheatSection {
+                level,
+                heading,
+                body_preview: String::new(),
+            });
+        } else if !sections.is_empty() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                if !current_body.is_empty() {
+                    current_body.push(' ');
+                }
+                current_body.push_str(trimmed);
+            }
+        }
+    }
+
+    // Flush the last section.
+    if let Some(last) = sections.last_mut() {
+        if last.body_preview.is_empty() {
+            last.body_preview = truncate_chars(&current_body, 120);
+        }
+    }
+
+    // Build a compact inventory string.
+    let inventory = sections
+        .iter()
+        .map(|s| {
+            let prefix = "#".repeat(s.level);
+            format!(
+                "{} {}\n  body: {}\n",
+                prefix,
+                s.heading,
+                if s.body_preview.is_empty() {
+                    "(empty)"
+                } else {
+                    &s.body_preview
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (sections, inventory)
+}
+
+// ---------------------------------------------------------------------------
+// Cheating Sheet generation result
+// ---------------------------------------------------------------------------
+
+/// Result of a cheating sheet Markdown generation pass.
+#[derive(Debug, Clone)]
+struct CheatingSheetGenerationResult {
+    markdown: String,
+    target_chars: usize,
+    generated_chars: usize,
+    harness_attempts: usize,
+    expansion_used: bool,
+    underfilled_reason: Option<String>,
+}
+
+/// Decide whether to attempt an expansion pass.
+///
+/// Expansion is warranted only when the rendered page count is below max_pages
+/// AND the source is long enough to support meaningful additions.
+/// We prefer compression of over-generated content to expansion of under-generated content.
+fn should_attempt_expansion(
+    _generated_chars: usize,
+    _min_acceptable_chars: usize,
+    page_count: usize,
+    max_pages: usize,
+    source_too_short: bool,
+) -> bool {
+    if source_too_short {
+        return false;
+    }
+    page_count < max_pages
+}
+
+/// Build metadata JSON for a cheating sheet output.
+///
+/// Preserves the existing metadata keys and adds the new capacity-aware fields.
+fn build_cheatsheet_metadata(
+    progress_current: usize,
+    progress_total: usize,
+    progress_label: &str,
+    max_pages: usize,
+    page_count: usize,
+    compression_attempts: usize,
+    template_used: &str,
+    markdown_path: &str,
+    reference_digest_output_id: &str,
+    target_chars: usize,
+    generated_chars: usize,
+    harness_attempts: usize,
+    expansion_used: bool,
+    final_page_count: usize,
+    underfilled_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "progress_current": progress_current,
+        "progress_total": progress_total,
+        "progress_label": progress_label,
+        "max_pages": max_pages,
+        "page_count": page_count,
+        "compression_attempts": compression_attempts,
+        "template_used": template_used,
+        "markdown_path": markdown_path,
+        "reference_digest_output_id": reference_digest_output_id,
+        "target_chars": target_chars,
+        "generated_chars": generated_chars,
+        "harness_attempts": harness_attempts,
+        "expansion_used": expansion_used,
+        "final_page_count": final_page_count,
+    });
+    if let Some(reason) = underfilled_reason {
+        meta["underfilled_reason"] = serde_json::json!(reason);
+    }
+    meta
+}
+
+// ---------------------------------------------------------------------------
+// Expansion prompt builder
+// ---------------------------------------------------------------------------
+
+/// Build an expansion prompt that asks the LLM to add high-value material
+/// from the Reference Digest to an existing cheating sheet.
+fn build_expansion_prompt(
+    current_cheat: &str,
+    section_inventory: &str,
+    ref_digest_excerpt: &str,
+    target_add_chars: usize,
+) -> (String, String) {
+    let system_prompt = "You expand an existing exam cheat-sheet Markdown by adding high-value material \
+from the Reference Digest. Preserve the existing structure, headings, and content exactly as-is. \
+Only add new material where it fits naturally: definitions, formulas, conditions, algorithm steps, \
+pitfalls, comparisons, and exam judgement rules that are in the Reference Digest but missing from \
+the cheat sheet. It is better to add slightly too much than too little — the renderer will compress \
+if needed. \
+Do not fabricate facts, do not rewrite existing sections, and do not change the document structure. \
+Return ONLY Markdown, with no code fences, no explanations, and no raw LaTeX commands except ordinary \
+math delimited by $...$ or $$...$$. The Markdown will be inserted into a XeLaTeX/xeCJK four-column A4 \
+template, so avoid syntax that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, \
+nested tables, Mermaid, TikZ, custom macros, \\begin blocks, or unbalanced braces. \
+Use only #, ##, ### headings, -, 1. lists, inline code for identifiers, bold for key terms, \
+and standard Markdown math.";
+
+    let user_prompt = format!(
+        "The existing cheat sheet below should be expanded with missing high-value content \
+from the Reference Digest. \
+Add approximately {} more characters of high-value material. \
+Maintain the exact same heading hierarchy and document structure.\n\n\
+Section inventory (all sections must remain covered):\n{}\n\n\
+Existing cheat sheet:\n{}\n\n\
+Reference Digest excerpt:\n{}\n\n\
+Add the most exam-critical missing material: definitions, formulas, conditions, pitfalls, \
+algorithm steps, comparisons, and judgement rules. Do NOT add narrative, examples without \
+reusable patterns, or anything already covered. \
+Return the complete expanded cheat-sheet Markdown.",
+        target_add_chars, section_inventory, current_cheat, ref_digest_excerpt
+    );
+
+    (system_prompt.to_string(), user_prompt)
+}
+
 async fn run_cheating_sheet_outputs(
     process_id: &str,
     outputs: &[ProcessOutput],
@@ -5088,14 +6756,14 @@ async fn run_cheating_sheet_outputs(
         Some(process) => process,
         None => return,
     };
-    let note_patch = process
-        .outputs
-        .iter()
-        .find(|o| o.kind == ProcessOutputKind::NotePatch && o.status == ProcessRecordStatus::Ready);
-    let note_patch = match note_patch {
+    let ref_digest = process.outputs.iter().find(|o| {
+        o.kind == ProcessOutputKind::ReferenceDigest && o.status == ProcessRecordStatus::Ready
+    });
+    let ref_digest = match ref_digest {
         Some(output) => output,
         None => {
-            let err_msg = "Cheating Sheet requires a completed Note Patch output.".to_string();
+            let err_msg =
+                "Cheating Sheet requires a completed Reference Digest output.".to_string();
             for output in outputs {
                 let _ = process_store.update(process_id, |r| {
                     if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
@@ -5109,10 +6777,10 @@ async fn run_cheating_sheet_outputs(
         }
     };
 
-    let note_markdown = match fs::read_to_string(&note_patch.path) {
+    let ref_digest_markdown = match fs::read_to_string(&ref_digest.path) {
         Ok(content) => content,
         Err(e) => {
-            let err_msg = format!("Failed to read Note Patch output: {}", e);
+            let err_msg = format!("Failed to read Reference Digest output: {}", e);
             for output in outputs {
                 let _ = process_store.update(process_id, |r| {
                     if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
@@ -5143,15 +6811,56 @@ async fn run_cheating_sheet_outputs(
             .unwrap_or(2)
             .clamp(1, 20);
 
-        let cheat_markdown = match generate_cheating_sheet_markdown(&note_markdown, max_pages).await
+        let ref_digest_chars = ref_digest_markdown.chars().count();
+        let budget = estimate_cheating_sheet_budget(max_pages);
+        let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
+
+        let gen_result = match generate_cheating_sheet_markdown(&ref_digest_markdown, max_pages)
+            .await
         {
-            Ok(markdown) => markdown,
+            Ok(result) => result,
             Err(e) => {
                 web_log(format!(
-                    "job {} cheating-sheet: LLM condensation failed, rendering compressed Note Patch directly: {}",
+                    "job {} cheating-sheet: LLM condensation failed, rendering compressed Reference Digest directly: {}",
                     job_id, e
                 ));
-                latex::compress_content(&note_markdown, 1)
+                let fallback_md = latex::compress_content(&ref_digest_markdown, 1);
+                let fallback_chars = fallback_md.chars().count();
+                // Fallback with no expansion — cannot expand a non-LLM draft.
+                let markdown_path =
+                    cheating_sheet_markdown_path(process_store, process_id, &output.id);
+                if let Some(parent) = markdown_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Err(write_err) = fs::write(&markdown_path, &fallback_md) {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(format!(
+                                "Failed to write Cheating Sheet Markdown: {}",
+                                write_err
+                            ));
+                            o.updated_at = ProcessRecord::now_iso();
+                        }
+                    });
+                    continue;
+                }
+                // Render fallback without expansion.
+                finish_cheating_sheet_render(
+                    process_store,
+                    process_id,
+                    output,
+                    ref_digest,
+                    &fallback_md,
+                    &markdown_path,
+                    max_pages,
+                    budget.target_chars,
+                    fallback_chars,
+                    0,
+                    false,
+                    Some("llm_failed".to_string()),
+                );
+                continue;
             }
         };
 
@@ -5159,7 +6868,7 @@ async fn run_cheating_sheet_outputs(
         if let Some(parent) = markdown_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Err(e) = fs::write(&markdown_path, &cheat_markdown) {
+        if let Err(e) = fs::write(&markdown_path, &gen_result.markdown) {
             let _ = process_store.update(process_id, |r| {
                 if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
                     o.status = ProcessRecordStatus::Failed;
@@ -5191,26 +6900,156 @@ async fn run_cheating_sheet_outputs(
             max_pages,
         );
 
-        match render_result {
+        // Determine if expansion is needed.
+        let should_expand = match &render_result {
+            Ok(artifact) => should_attempt_expansion(
+                gen_result.generated_chars,
+                budget.min_acceptable_chars,
+                artifact.page_count,
+                max_pages,
+                source_too_short,
+            ),
+            Err(_) => false, // Don't expand if first render failed.
+        };
+
+        let (final_result, expansion_used, final_page_count) = if should_expand {
+            update_single_output_progress(
+                process_store,
+                process_id,
+                &output.id,
+                3,
+                4,
+                "expanding content",
+            );
+
+            let current_chars = gen_result.generated_chars;
+            let target_add_chars = (budget.target_chars.saturating_sub(current_chars))
+                .min(6000)
+                .max(2000);
+            let (_sections, inventory) = build_section_inventory(&ref_digest_markdown);
+            let ref_digest_excerpt =
+                truncate_ref_digest_for_cheatsheet(&ref_digest_markdown, 90000).0;
+
+            let (exp_system, exp_user) = build_expansion_prompt(
+                &gen_result.markdown,
+                &inventory,
+                &ref_digest_excerpt,
+                target_add_chars,
+            );
+
+            match crate::llm::chat_text(&exp_system, &exp_user, 0.2, 81920).await {
+                Ok(expanded_text) => {
+                    let expanded_md = strip_markdown_fences(&expanded_text);
+                    let expanded_chars = expanded_md.chars().count();
+
+                    // Write expanded markdown.
+                    if let Err(e) = fs::write(&markdown_path, &expanded_md) {
+                        web_log(format!(
+                            "job {} cheating-sheet: failed to write expansion markdown: {}",
+                            job_id, e
+                        ));
+                        // Fall back to first render result.
+                        (
+                            gen_result,
+                            false,
+                            render_result.as_ref().ok().map(|a| a.page_count),
+                        )
+                    } else {
+                        let exp_render = latex::render_cheatsheet(
+                            &markdown_path.to_string_lossy(),
+                            None,
+                            &pdf_path.to_string_lossy(),
+                            max_pages,
+                        );
+
+                        match exp_render {
+                            Ok(exp_artifact) => {
+                                let mut result = gen_result.clone();
+                                result.markdown = expanded_md;
+                                result.generated_chars = expanded_chars;
+                                result.harness_attempts = 2;
+                                result.expansion_used = true;
+                                (result, true, Some(exp_artifact.page_count))
+                            }
+                            Err(e) => {
+                                web_log(format!(
+                                    "job {} cheating-sheet: expansion render failed, keeping first draft: {}",
+                                    job_id, e
+                                ));
+                                // Restore first draft markdown.
+                                let _ = fs::write(&markdown_path, &gen_result.markdown);
+                                (
+                                    gen_result,
+                                    false,
+                                    render_result.as_ref().ok().map(|a| a.page_count),
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    web_log(format!(
+                        "job {} cheating-sheet: expansion LLM call failed, keeping first draft: {}",
+                        job_id, e
+                    ));
+                    (
+                        gen_result,
+                        false,
+                        render_result.as_ref().ok().map(|a| a.page_count),
+                    )
+                }
+            }
+        } else {
+            let page_count = render_result.as_ref().ok().map(|a| a.page_count);
+            let underfilled_reason = if source_too_short {
+                Some("source_too_short".to_string())
+            } else {
+                None
+            };
+            let mut result = gen_result;
+            result.underfilled_reason = underfilled_reason;
+            (result, false, page_count)
+        };
+
+        // Final render if needed (when expansion was used, render already done above).
+        let final_render_result = if expansion_used {
+            // Re-render to get fresh artifact (the expansion already wrote the file).
+            latex::render_cheatsheet(
+                &markdown_path.to_string_lossy(),
+                None,
+                &pdf_path.to_string_lossy(),
+                max_pages,
+            )
+        } else {
+            render_result
+        };
+
+        match final_render_result {
             Ok(artifact) => {
                 let _ = process_store.update(process_id, |r| {
                     if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
                         o.status = ProcessRecordStatus::Ready;
                         o.path = artifact.pdf_path.clone();
                         o.diff_path = None;
-                        o.base_source_id = Some(note_patch.id.clone());
+                        o.base_source_id = Some(ref_digest.id.clone());
                         o.last_error = None;
-                        o.metadata = serde_json::json!({
-                            "progress_current": 4,
-                            "progress_total": 4,
-                            "progress_label": "complete",
-                            "max_pages": max_pages,
-                            "page_count": artifact.page_count,
-                            "compression_attempts": artifact.compression_attempts,
-                            "template_used": artifact.template_used,
-                            "markdown_path": markdown_path.to_string_lossy().to_string(),
-                            "source_note_patch_output_id": note_patch.id.clone(),
-                        });
+                        o.metadata = build_cheatsheet_metadata(
+                            4,
+                            4,
+                            "complete",
+                            max_pages,
+                            artifact.page_count,
+                            artifact.compression_attempts,
+                            &artifact.template_used,
+                            &markdown_path.to_string_lossy().to_string(),
+                            &ref_digest.id,
+                            final_result.target_chars,
+                            final_result.generated_chars,
+                            final_result.harness_attempts,
+                            final_result.expansion_used,
+                            final_page_count.unwrap_or(artifact.page_count),
+                            final_result.underfilled_reason.as_deref(),
+                        );
                         o.updated_at = ProcessRecord::now_iso();
                     }
                 });
@@ -5220,14 +7059,23 @@ async fn run_cheating_sheet_outputs(
                     if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
                         o.status = ProcessRecordStatus::Failed;
                         o.last_error = Some(format!("Cheating Sheet render failed: {}", e));
-                        o.metadata = serde_json::json!({
-                            "progress_current": 3,
-                            "progress_total": 4,
-                            "progress_label": "render failed",
-                            "max_pages": max_pages,
-                            "markdown_path": markdown_path.to_string_lossy().to_string(),
-                            "source_note_patch_output_id": note_patch.id.clone(),
-                        });
+                        o.metadata = build_cheatsheet_metadata(
+                            3,
+                            4,
+                            "render failed",
+                            max_pages,
+                            0,
+                            0,
+                            "",
+                            &markdown_path.to_string_lossy().to_string(),
+                            &ref_digest.id,
+                            final_result.target_chars,
+                            final_result.generated_chars,
+                            final_result.harness_attempts,
+                            final_result.expansion_used,
+                            0,
+                            final_result.underfilled_reason.as_deref(),
+                        );
                         o.updated_at = ProcessRecord::now_iso();
                     }
                 });
@@ -5236,35 +7084,262 @@ async fn run_cheating_sheet_outputs(
     }
 }
 
-async fn generate_cheating_sheet_markdown(note_markdown: &str, max_pages: usize) -> Result<String> {
+/// Helper to finalize a cheating sheet render result (used for fallback path).
+fn finish_cheating_sheet_render(
+    process_store: &ProcessStore,
+    process_id: &str,
+    output: &ProcessOutput,
+    ref_digest: &ProcessOutput,
+    _cheat_markdown: &str,
+    markdown_path: &std::path::Path,
+    max_pages: usize,
+    target_chars: usize,
+    generated_chars: usize,
+    harness_attempts: usize,
+    expansion_used: bool,
+    underfilled_reason: Option<String>,
+) {
+    let pdf_path = process_output_path_for(
+        process_store,
+        process_id,
+        &output.id,
+        &ProcessOutputKind::CheatingSheet,
+    );
+    let render_result = latex::render_cheatsheet(
+        &markdown_path.to_string_lossy(),
+        None,
+        &pdf_path.to_string_lossy(),
+        max_pages,
+    );
+
+    match render_result {
+        Ok(artifact) => {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Ready;
+                    o.path = artifact.pdf_path.clone();
+                    o.diff_path = None;
+                    o.base_source_id = Some(ref_digest.id.clone());
+                    o.last_error = None;
+                    o.metadata = build_cheatsheet_metadata(
+                        4,
+                        4,
+                        "complete",
+                        max_pages,
+                        artifact.page_count,
+                        artifact.compression_attempts,
+                        &artifact.template_used,
+                        &markdown_path.to_string_lossy().to_string(),
+                        &ref_digest.id,
+                        target_chars,
+                        generated_chars,
+                        harness_attempts,
+                        expansion_used,
+                        artifact.page_count,
+                        underfilled_reason.as_deref(),
+                    );
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+        }
+        Err(e) => {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Cheating Sheet render failed: {}", e));
+                    o.metadata = build_cheatsheet_metadata(
+                        3,
+                        4,
+                        "render failed",
+                        max_pages,
+                        0,
+                        0,
+                        "",
+                        &markdown_path.to_string_lossy().to_string(),
+                        &ref_digest.id,
+                        target_chars,
+                        generated_chars,
+                        harness_attempts,
+                        expansion_used,
+                        0,
+                        underfilled_reason.as_deref(),
+                    );
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+        }
+    }
+}
+
+/// Truncate a Reference Digest for the cheat-sheet prompt by taking
+/// proportional excerpts from each `##` section rather than only the
+/// first N characters.  This ensures every topic has at least a minimal
+/// presence in the prompt, avoiding total omission of later sections.
+///
+/// Returns the truncated Markdown and the number of sections included.
+fn truncate_ref_digest_for_cheatsheet(markdown: &str, max_chars: usize) -> (String, usize) {
+    let min_per_section: usize = 600;
+    let preamble_budget: usize = 1200;
+
+    // Split on `## ` boundaries.
+    let mut sections: Vec<(usize, &str)> = Vec::new(); // (start_byte_offset, full_text)
+    let mut preamble_end: usize = 0;
+
+    // Find the first `\n## ` boundary.
+    if let Some(first_h2) = markdown.find("\n## ") {
+        preamble_end = first_h2;
+        let body = &markdown[first_h2..];
+        // Split body into h2-headed sections.
+        let mut prev_start: usize = 0;
+        for m in regex::Regex::new(r"\n## ").unwrap().find_iter(body) {
+            if prev_start > 0 {
+                sections.push((
+                    first_h2 + prev_start,
+                    &markdown[first_h2 + prev_start..first_h2 + m.start()],
+                ));
+            }
+            prev_start = m.start();
+        }
+        // Last section.
+        if prev_start < body.len() {
+            sections.push((first_h2 + prev_start, &markdown[first_h2 + prev_start..]));
+        }
+    }
+
+    if sections.is_empty() {
+        // No h2 headings — fall back to head-only truncation.
+        return (truncate_for_llm(markdown, max_chars), 0);
+    }
+
+    let total_sections = sections.len();
+
+    // Allocate budget: preamble gets preamble_budget chars, remainder
+    // is split proportionally among sections, with min_per_section floor.
+    let preamble = truncate_chars(&markdown[..preamble_end], preamble_budget);
+    let body_budget = max_chars.saturating_sub(preamble.chars().count());
+
+    let min_floor = total_sections.saturating_mul(min_per_section);
+    if body_budget <= min_floor {
+        // Tight budget: give each section exactly min_per_section chars.
+        let mut result = preamble;
+        result.push('\n');
+        for (_offset, section_text) in &sections {
+            if let Some(heading_end) = section_text.find('\n') {
+                result.push_str(&section_text[..heading_end]);
+                result.push('\n');
+                let body_start = heading_end + 1;
+                let body = &section_text[body_start..];
+                result.push_str(&truncate_chars(body.trim_start(), min_per_section));
+                result.push_str("\n\n");
+            }
+        }
+        return (result, total_sections);
+    }
+
+    // Proportional allocation: each section gets its share of the remaining
+    // budget based on its character count.
+    let total_chars: usize = sections.iter().map(|(_, t)| t.chars().count()).sum();
+    let mut result = preamble;
+    result.push('\n');
+
+    for (_offset, section_text) in &sections {
+        let section_chars = section_text.chars().count();
+        let share = if total_chars > 0 {
+            ((section_chars as f64 / total_chars as f64) * body_budget as f64) as usize
+        } else {
+            body_budget / total_sections
+        };
+        let alloc = share.max(min_per_section);
+
+        if let Some(heading_end) = section_text.find('\n') {
+            result.push_str(&section_text[..heading_end]);
+            result.push('\n');
+            let body_start = heading_end + 1;
+            let body = &section_text[body_start..];
+            result.push_str(&truncate_chars(body.trim_start(), alloc));
+            result.push_str("\n\n");
+        }
+    }
+
+    (result, total_sections)
+}
+
+/// Build shared Cheat Sheet prompts (used by both streaming and non-streaming paths).
+fn build_cheat_sheet_prompts(ref_digest_markdown: &str, max_pages: usize) -> (String, String) {
+    let budget = estimate_cheating_sheet_budget(max_pages);
+    let (sections, inventory) = build_section_inventory(ref_digest_markdown);
+
+    let section_count = sections.len();
+    let section_list: Vec<String> = sections.iter().map(|s| s.heading.clone()).collect();
+    let section_names = section_list.join(" | ");
+
+    let system_prompt = "You convert a Reference Digest into an exam reference cheat-sheet Markdown \
+for a fixed LaTeX template. Cover every topic comprehensively: for each section, include its essential \
+definitions, formulas, conditions, algorithm steps, comparisons, pitfalls, and exam judgement rules. \
+It is better to include slightly too much content than too little — the renderer will compress if \
+needed. Do not omit topics.\n\
+Return ONLY Markdown, with no code fences, no explanations, and no raw LaTeX commands except ordinary \
+math delimited by $...$ or $$...$$. \
+The Markdown will be escaped and inserted into a XeLaTeX/xeCJK four-column A4 template, so avoid \
+syntax that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, nested tables, \
+Mermaid, TikZ, custom macros, \\begin blocks, or unbalanced braces. \
+Use Chinese for Chinese source material, keep standard English technical terms, identifiers, and formulas. \
+Prefer short headings, information-rich bullets, definitions, theorem/condition/result patterns, \
+formulas, contrasts, and procedure steps. \
+Use only #, ##, ### headings, -, 1. lists, inline code for identifiers, bold for key terms, \
+and standard Markdown math. \
+Every formula must be syntactically balanced. Keep underscores and percent signs inside math or code \
+when possible.";
+
+    let user_prompt = format!(
+        "Target: a {} page(s) exam cheat sheet.\n\
+Roughly {} characters typically fills {} page(s); up to {} is fine — the renderer will \
+compress if needed.\n\n\
+Coverage requirement: the Reference Digest has {} main sections in order: {}\n\
+Every main section MUST contribute at least one of: definition, formula, condition, algorithm step, \
+pitfall, comparison, or exam judgement rule.\n\n\
+Do not invent new facts. Extract and organize the essential content from the Reference Digest below. \
+Prefer completeness over conciseness.\n\n\
+Section inventory:\n{}\n\n\
+Reference Digest Markdown:\n\n{}\n\n\
+Return only the complete cheating-sheet Markdown. Aim for roughly {} characters; more is acceptable.",
+        max_pages,
+        budget.target_chars,
+        max_pages,
+        budget.soft_max_chars,
+        section_count,
+        section_names,
+        inventory,
+        truncate_ref_digest_for_cheatsheet(ref_digest_markdown, 90000).0,
+        budget.target_chars,
+    );
+
+    (system_prompt.to_string(), user_prompt)
+}
+
+async fn generate_cheating_sheet_markdown(
+    ref_digest_markdown: &str,
+    max_pages: usize,
+) -> Result<CheatingSheetGenerationResult> {
     if !crate::llm::is_available() {
         bail!("LLM is not available");
     }
 
-    let system_prompt = "You convert patched lecture notes into compact exam cheat-sheet Markdown for a fixed LaTeX template. \
-Return ONLY Markdown, with no code fences, no explanations, and no raw LaTeX commands except ordinary math delimited by $...$ or $$...$$. \
-The Markdown will be escaped and inserted into a XeLaTeX/xeCJK four-column A4 template, so avoid syntax that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, nested tables, Mermaid, TikZ, custom macros, \\begin blocks, or unbalanced braces. \
-Use Chinese for Chinese source material, keep standard English technical terms, identifiers, and formulas. \
-Prefer short headings, dense bullets, definitions, theorem/condition/result patterns, formulas, contrasts, and procedure steps. \
-Use only #, ##, ### headings, -, 1. lists, inline code for identifiers, bold for key terms, and standard Markdown math. \
-Every formula must be syntactically balanced. Keep underscores and percent signs inside math or code when possible.";
+    let budget = estimate_cheating_sheet_budget(max_pages);
+    let (system_prompt, user_prompt) = build_cheat_sheet_prompts(ref_digest_markdown, max_pages);
 
-    let user_prompt = format!(
-        "Target page budget: at most {} A4 page(s), four columns, about 5pt body text. \
-Create a compact Markdown cheating sheet from the patched note below.\n\n\
-Compression policy:\n\
-- Keep exam-critical definitions, equations, assumptions, algorithms, edge cases, and comparison tables converted to bullets.\n\
-- Remove narrative transitions, timestamps, source citations, examples that do not add a reusable pattern, and repeated explanations.\n\
-- If content is too long, prefer fewer words per bullet over dropping core formulas.\n\
-- Use Chinese punctuation sparingly and keep lines short.\n\n\
-Patched Note Markdown:\n\n{}\n\n\
-Return only the complete cheating-sheet Markdown.",
-        max_pages,
-        truncate_for_llm(note_markdown, 60000)
-    );
+    let text = crate::llm::chat_text(&system_prompt, &user_prompt, 0.2, 81920).await?;
+    let markdown = strip_markdown_fences(&text);
+    let generated_chars = markdown.chars().count();
 
-    let text = crate::llm::chat_text(system_prompt, &user_prompt, 0.2, 16384).await?;
-    Ok(strip_markdown_fences(&text))
+    Ok(CheatingSheetGenerationResult {
+        markdown,
+        target_chars: budget.target_chars,
+        generated_chars,
+        harness_attempts: 1,
+        expansion_used: false,
+        underfilled_reason: None,
+    })
 }
 
 fn strip_markdown_fences(text: &str) -> String {
@@ -5356,7 +7431,7 @@ async fn generate_section_patches(
         truncate_chars(body, 4000),
         truncate_for_llm(context, 45000)
     );
-    let json = crate::llm::chat_json(system, &user, 0.2, 4096).await?;
+    let json = crate::llm::chat_json(system, &user, 0.2, 8192).await?;
     let mut patches = Vec::new();
     if let Some(arr) = json.get("patches").and_then(|v| v.as_array()) {
         for item in arr {
@@ -5574,7 +7649,7 @@ async fn api_add_process_output(
         None => {
             return Json(serde_json::json!({
                 "status": "failed",
-                "error": format!("Unsupported output kind: {}. Supported kinds: note_patch, cheating_sheet.", body.kind),
+                "error": format!("Unsupported output kind: {}. Supported kinds: note_patch, reference_digest, cheating_sheet.", body.kind),
             }));
         }
     };
@@ -5593,6 +7668,10 @@ async fn api_add_process_output(
         .outputs
         .iter()
         .any(|o| o.kind == ProcessOutputKind::NotePatch);
+    let has_reference_digest = process
+        .outputs
+        .iter()
+        .any(|o| o.kind == ProcessOutputKind::ReferenceDigest);
     let has_cheating_sheet = process
         .outputs
         .iter()
@@ -5605,6 +7684,13 @@ async fn api_add_process_output(
         }));
     }
 
+    if requested_kind == ProcessOutputKind::ReferenceDigest && has_reference_digest {
+        return Json(serde_json::json!({
+            "status": "failed",
+            "error": "Reference Digest output already exists for this process. Only one reference_digest output is supported.",
+        }));
+    }
+
     if requested_kind == ProcessOutputKind::CheatingSheet && has_cheating_sheet {
         return Json(serde_json::json!({
             "status": "failed",
@@ -5612,11 +7698,24 @@ async fn api_add_process_output(
         }));
     }
 
+    // Check if there is an existing Reference Digest in Ready or Processing state for reuse.
+    let existing_rd_usable =
+        if requested_kind == ProcessOutputKind::CheatingSheet && !has_reference_digest {
+            // Also check for Processing reference digest that could be reused.
+            process.outputs.iter().any(|o| {
+                o.kind == ProcessOutputKind::ReferenceDigest
+                    && (o.status == ProcessRecordStatus::Ready
+                        || o.status == ProcessRecordStatus::Processing)
+            })
+        } else {
+            has_reference_digest
+        };
+
     let now = ProcessRecord::now_iso();
     let mut new_outputs = Vec::new();
     let mut kinds_to_add = Vec::new();
-    if requested_kind == ProcessOutputKind::CheatingSheet && !has_note_patch {
-        kinds_to_add.push((ProcessOutputKind::NotePatch, 2usize));
+    if requested_kind == ProcessOutputKind::CheatingSheet && !existing_rd_usable {
+        kinds_to_add.push((ProcessOutputKind::ReferenceDigest, 0usize));
     }
     kinds_to_add.push((
         requested_kind.clone(),
@@ -5637,7 +7736,13 @@ async fn api_add_process_output(
         }
         let markdown_path =
             cheating_sheet_markdown_path(&state.process_store, &process_id, &output_id);
-        let metadata = if kind == ProcessOutputKind::CheatingSheet {
+        let metadata = if kind == ProcessOutputKind::ReferenceDigest {
+            serde_json::json!({
+                "progress_current": 0,
+                "progress_total": 2,
+                "progress_label": "queued",
+            })
+        } else if kind == ProcessOutputKind::CheatingSheet {
             serde_json::json!({
                 "progress_current": 0,
                 "progress_total": 4,
@@ -5861,12 +7966,12 @@ async fn api_revise_process_output(
     if let Some(ref base) = base_note_content {
         user_prompt.push_str(&format!(
             "\n\nFor reference, here is the original base note (before patching):\n\n{}",
-            truncate_for_llm(base, 20000)
+            truncate_for_llm(base, 40000)
         ));
     }
 
     // Call LLM.
-    let updated_md = match crate::llm::chat_text(system_prompt, &user_prompt, 0.3, 16384).await {
+    let updated_md = match crate::llm::chat_text(system_prompt, &user_prompt, 0.3, 32768).await {
         Ok(text) => {
             let cleaned = text.trim();
             let cleaned = if cleaned.starts_with("```markdown") {
@@ -6399,6 +8504,74 @@ mod tests {
         }
     }
 
+    fn requested_output(kind: &str, max_pages: Option<usize>) -> CreateProcessOutputBody {
+        CreateProcessOutputBody {
+            kind: kind.to_string(),
+            max_pages,
+        }
+    }
+
+    #[test]
+    fn test_reference_digest_output_kind_parse_and_display() {
+        assert_eq!(
+            parse_process_output_kind("reference_digest"),
+            Some(ProcessOutputKind::ReferenceDigest)
+        );
+        assert_eq!(
+            ProcessOutputKind::ReferenceDigest.to_string(),
+            "reference_digest"
+        );
+        assert_eq!(
+            process_output_title(&ProcessOutputKind::ReferenceDigest),
+            "Reference Digest"
+        );
+    }
+
+    #[test]
+    fn test_reference_digest_dependency_expansion_for_cheating_sheet() {
+        let outputs = vec![requested_output("cheating_sheet", Some(3))];
+        let expanded = expand_output_kinds(&outputs).expect("expand outputs");
+
+        assert_eq!(
+            expanded,
+            vec![
+                (ProcessOutputKind::ReferenceDigest, 0),
+                (ProcessOutputKind::CheatingSheet, 3)
+            ]
+        );
+        assert!(!expanded
+            .iter()
+            .any(|(kind, _)| *kind == ProcessOutputKind::NotePatch));
+    }
+
+    #[test]
+    fn test_reference_digest_dependency_expansion_keeps_explicit_note_patch_parallel() {
+        let outputs = vec![
+            requested_output("note_patch", None),
+            requested_output("cheating_sheet", Some(2)),
+        ];
+        let expanded = expand_output_kinds(&outputs).expect("expand outputs");
+
+        assert_eq!(
+            expanded,
+            vec![
+                (ProcessOutputKind::NotePatch, 2),
+                (ProcessOutputKind::ReferenceDigest, 0),
+                (ProcessOutputKind::CheatingSheet, 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reference_digest_prompt_uses_note_as_structure_reference() {
+        let note = Some("# Important\n\nExisting Note content".to_string());
+        let prompt = build_ref_digest_user_prompt(&note, "Transcript context", None);
+
+        assert!(prompt.contains("structure / priority / style reference only"));
+        assert!(prompt.contains("not a length constraint"));
+        assert!(prompt.contains("Transcript context"));
+    }
+
     #[test]
     fn test_extract_date_from_begin_time() {
         let v = make_video("2024-09-18 08:00:00", "Lecture 1", "v1");
@@ -6626,7 +8799,12 @@ mod tests {
     // Section retrieval: date-hint preference and index limit
     // -----------------------------------------------------------------------
 
-    fn make_test_index(date: &str, title: &str, summary: &str, keywords: &[&str]) -> CourseDateIndex {
+    fn make_test_index(
+        date: &str,
+        title: &str,
+        summary: &str,
+        keywords: &[&str],
+    ) -> CourseDateIndex {
         CourseDateIndex {
             date: date.to_string(),
             title: title.to_string(),
@@ -6645,8 +8823,18 @@ mod tests {
     fn test_retrieval_prefers_date_hints_over_bm25() {
         let indexes = vec![
             make_test_index("2024-09-10", "Unrelated", "nothing useful", &[]),
-            make_test_index("2024-09-18", "Optimization", "gradient descent and convexity", &["gradient", "convex"]),
-            make_test_index("2024-09-19", "More Optimization", "stochastic gradient descent", &["sgd"]),
+            make_test_index(
+                "2024-09-18",
+                "Optimization",
+                "gradient descent and convexity",
+                &["gradient", "convex"],
+            ),
+            make_test_index(
+                "2024-09-19",
+                "More Optimization",
+                "stochastic gradient descent",
+                &["sgd"],
+            ),
         ];
 
         let section = PlannedSection {
@@ -6675,8 +8863,18 @@ mod tests {
     #[test]
     fn test_retrieval_falls_back_to_bm25_when_no_date_hints() {
         let indexes = vec![
-            make_test_index("2024-09-18", "Intro", "syllabus and logistics", &["syllabus"]),
-            make_test_index("2024-09-19", "Optimization", "gradient descent algorithm", &["gradient", "descent"]),
+            make_test_index(
+                "2024-09-18",
+                "Intro",
+                "syllabus and logistics",
+                &["syllabus"],
+            ),
+            make_test_index(
+                "2024-09-19",
+                "Optimization",
+                "gradient descent algorithm",
+                &["gradient", "descent"],
+            ),
         ];
 
         let section = PlannedSection {
@@ -6831,10 +9029,20 @@ mod tests {
         let ctx = build_outline_context(&indexes);
         // Only 3 ranges should appear (take(3)). Slide 3 should not appear.
         for i in 0..3 {
-            assert!(ctx.contains(&format!("Content for slide {}", i)), "should include slide {}", i);
+            assert!(
+                ctx.contains(&format!("Content for slide {}", i)),
+                "should include slide {}",
+                i
+            );
         }
-        assert!(!ctx.contains("Content for slide 3"), "should limit to 3 ranges");
-        assert!(!ctx.contains("Content for slide 9"), "should limit to 3 ranges");
+        assert!(
+            !ctx.contains("Content for slide 3"),
+            "should limit to 3 ranges"
+        );
+        assert!(
+            !ctx.contains("Content for slide 9"),
+            "should limit to 3 ranges"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6913,7 +9121,12 @@ mod tests {
     // Fallback outline
     // -----------------------------------------------------------------------
 
-    fn make_fake_index(date: &str, title: &str, keywords: &[&str], concepts: &[&str]) -> CourseDateIndex {
+    fn make_fake_index(
+        date: &str,
+        title: &str,
+        keywords: &[&str],
+        concepts: &[&str],
+    ) -> CourseDateIndex {
         CourseDateIndex {
             date: date.to_string(),
             title: title.to_string(),
@@ -6963,8 +9176,15 @@ mod tests {
         ];
 
         let sections = generate_fallback_outline(&indexes).unwrap();
-        assert!(sections.len() >= 1, "expected at least 1 section, got {}", sections.len());
-        assert!(sections.len() <= 2, "expected at most 2 sections for 2 indexes");
+        assert!(
+            sections.len() >= 1,
+            "expected at least 1 section, got {}",
+            sections.len()
+        );
+        assert!(
+            sections.len() <= 2,
+            "expected at most 2 sections for 2 indexes"
+        );
         // All dates should be covered in date_hints across all sections.
         let all_dates: std::collections::HashSet<String> = sections
             .iter()
@@ -7003,7 +9223,12 @@ mod tests {
 
     #[test]
     fn test_fallback_outline_single_index() {
-        let indexes = vec![make_fake_index("2024-09-18", "Solo Lecture", &["solo"], &["concept"])];
+        let indexes = vec![make_fake_index(
+            "2024-09-18",
+            "Solo Lecture",
+            &["solo"],
+            &["concept"],
+        )];
         let sections = generate_fallback_outline(&indexes).unwrap();
         assert_eq!(sections.len(), 1);
         assert!(!sections[0].title.is_empty());
@@ -7039,5 +9264,372 @@ mod tests {
             "context budget exceeded: {}",
             context.chars().count()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cheating Sheet capacity estimation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_budget_estimation_one_page() {
+        let budget = estimate_cheating_sheet_budget(1);
+        assert_eq!(budget.target_chars, 11000);
+        assert_eq!(budget.soft_max_chars, 15000);
+        assert_eq!(budget.min_acceptable_chars, 8250); // 11000 * 3/4
+    }
+
+    #[test]
+    fn test_budget_estimation_two_pages() {
+        let budget = estimate_cheating_sheet_budget(2);
+        assert_eq!(budget.target_chars, 22000);
+        assert_eq!(budget.soft_max_chars, 30000);
+        assert_eq!(budget.min_acceptable_chars, 16500);
+    }
+
+    #[test]
+    fn test_budget_estimation_three_pages() {
+        let budget = estimate_cheating_sheet_budget(3);
+        assert_eq!(budget.target_chars, 33000);
+        assert_eq!(budget.soft_max_chars, 45000);
+        assert_eq!(budget.min_acceptable_chars, 24750);
+    }
+
+    #[test]
+    fn test_budget_clamped_at_20() {
+        let budget = estimate_cheating_sheet_budget(100);
+        assert_eq!(budget.target_chars, 20 * 11000);
+    }
+
+    #[test]
+    fn test_budget_minimum_one() {
+        let budget = estimate_cheating_sheet_budget(0);
+        assert_eq!(budget.target_chars, 11000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Markdown section inventory
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_section_inventory_extracts_headings_in_order() {
+        let md = "\
+# Course Title
+intro text here
+
+## Key Concepts
+- concept one
+- concept two
+
+### Sub Concept
+more details here
+
+## Another Section
+final content
+";
+        let (sections, inventory) = build_section_inventory(md);
+        assert_eq!(
+            sections.len(),
+            4,
+            "expected 4 sections, got {}",
+            sections.len()
+        );
+        assert_eq!(sections[0].heading, "Course Title");
+        assert_eq!(sections[0].level, 1);
+        assert_eq!(sections[1].heading, "Key Concepts");
+        assert_eq!(sections[1].level, 2);
+        assert_eq!(sections[2].heading, "Sub Concept");
+        assert_eq!(sections[2].level, 3);
+        assert_eq!(sections[3].heading, "Another Section");
+        assert_eq!(sections[3].level, 2);
+
+        // Inventory string must mention all headings.
+        assert!(inventory.contains("Course Title"));
+        assert!(inventory.contains("Key Concepts"));
+        assert!(inventory.contains("Sub Concept"));
+        assert!(inventory.contains("Another Section"));
+    }
+
+    #[test]
+    fn test_section_inventory_body_previews() {
+        let md = "\
+# Title
+
+## Section A
+This is the body of section A with enough content to make a reasonable preview for the inventory.
+
+## Section B
+Section B body is shorter.
+";
+        let (sections, _inventory) = build_section_inventory(md);
+        assert_eq!(sections.len(), 3);
+
+        // Section A should have a body preview.
+        assert!(!sections[1].body_preview.is_empty());
+        assert!(sections[1].body_preview.contains("This is the body"));
+
+        // Section B should have a body preview.
+        assert!(!sections[2].body_preview.is_empty());
+        assert!(sections[2].body_preview.contains("Section B body"));
+    }
+
+    #[test]
+    fn test_section_inventory_empty_markdown() {
+        let (sections, inventory) = build_section_inventory("");
+        assert!(sections.is_empty());
+        assert!(inventory.is_empty());
+    }
+
+    #[test]
+    fn test_section_inventory_no_headings() {
+        let md = "Just some text\nwithout any headings.\nMore text here.";
+        let (sections, _inventory) = build_section_inventory(md);
+        assert!(sections.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Expansion decision logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_underfilled_triggers_expansion_when_pages_below_max() {
+        // 12000 generated, min is 8250 (above), but only 1 page of 2.
+        let result = should_attempt_expansion(12000, 8250, 1, 2, false);
+        assert!(result, "should expand when page count < max pages");
+    }
+
+    #[test]
+    fn test_no_expansion_when_char_count_low_but_pages_full() {
+        // 3000 generated (well below min 8250), but page count already at max.
+        // Expansion should NOT trigger — page count is the sole criterion.
+        let result = should_attempt_expansion(3000, 8250, 2, 2, false);
+        assert!(
+            !result,
+            "should NOT expand when pages are full, even if char count is low"
+        );
+    }
+
+    #[test]
+    fn test_no_expansion_when_source_too_short() {
+        // 5000 generated, page count 1 of 2, but source is too short.
+        let result = should_attempt_expansion(5000, 8250, 1, 2, true);
+        assert!(!result, "should NOT expand when source is too short");
+    }
+
+    #[test]
+    fn test_no_expansion_when_filled() {
+        // 20000 generated, min is 8250, 2 pages of 2, source is long.
+        let result = should_attempt_expansion(20000, 8250, 2, 2, false);
+        assert!(!result, "should NOT expand when already filled");
+    }
+
+    // -----------------------------------------------------------------------
+    // Expansion prompt builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expansion_prompt_contains_current_cheat() {
+        let cheat = "# Title\n\n- bullet one\n- bullet two\n";
+        let inventory = "# Title\n  body: some preview\n";
+        let excerpt = "original note excerpt content";
+        let target_add = 3000;
+
+        let (_system, user) = build_expansion_prompt(cheat, inventory, excerpt, target_add);
+
+        // Should contain the existing cheat markdown.
+        assert!(user.contains("bullet one"));
+        assert!(user.contains("bullet two"));
+    }
+
+    #[test]
+    fn test_expansion_prompt_contains_section_inventory() {
+        let cheat = "# Cheat\ncontent\n";
+        let inventory = "## Key Concepts\n  body: gradient descent definition\n";
+        let excerpt = "original notes";
+        let target_add = 3000;
+
+        let (_system, user) = build_expansion_prompt(cheat, inventory, excerpt, target_add);
+
+        assert!(user.contains("Key Concepts"));
+        assert!(user.contains("gradient descent"));
+    }
+
+    #[test]
+    fn test_expansion_prompt_contains_target_add_chars() {
+        let cheat = "minimal";
+        let inventory = "inventory";
+        let excerpt = "notes";
+        let target_add = 5000;
+
+        let (_system, user) = build_expansion_prompt(cheat, inventory, excerpt, target_add);
+
+        assert!(user.contains("5000"));
+    }
+
+    #[test]
+    fn test_expansion_prompt_contains_latex_safety_constraints() {
+        let cheat = "content";
+        let inventory = "inv";
+        let excerpt = "notes";
+        let target_add = 2000;
+
+        let (system, _user) = build_expansion_prompt(cheat, inventory, excerpt, target_add);
+
+        // System prompt must prohibit raw LaTeX commands.
+        assert!(
+            system.contains("\\begin"),
+            "must mention \\begin prohibition"
+        );
+        assert!(
+            !system.contains("\\begin{"),
+            "should not contain an actual begin block"
+        );
+
+        // User prompt must mention LaTeX safety.
+        // The system prompt carries the constraints; user prompt focuses on content.
+        // Verify system has the key constraints.
+        assert!(system.contains("no HTML"));
+        assert!(system.contains("Markdown tables"));
+        assert!(system.contains("unbalanced braces"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_metadata_includes_target_generated_harness_expansion_fields() {
+        let meta = build_cheatsheet_metadata(
+            4,
+            4,
+            "complete",
+            2,
+            2,
+            0,
+            "default_cheatsheet.tex",
+            "/path/to/cheatsheet.md",
+            "reference_digest_id",
+            22000,
+            19500,
+            1,
+            false,
+            2,
+            None,
+        );
+
+        assert_eq!(meta["target_chars"], serde_json::json!(22000));
+        assert_eq!(meta["generated_chars"], serde_json::json!(19500));
+        assert_eq!(meta["harness_attempts"], serde_json::json!(1));
+        assert_eq!(meta["expansion_used"], serde_json::json!(false));
+        assert_eq!(meta["final_page_count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn test_metadata_includes_underfilled_reason_when_present() {
+        let meta = build_cheatsheet_metadata(
+            4,
+            4,
+            "complete",
+            2,
+            1,
+            0,
+            "default_cheatsheet.tex",
+            "/path/to/cheatsheet.md",
+            "note_patch_id",
+            22000,
+            5000,
+            1,
+            false,
+            1,
+            Some("source_too_short"),
+        );
+
+        assert_eq!(
+            meta["underfilled_reason"],
+            serde_json::json!("source_too_short")
+        );
+        assert_eq!(meta["target_chars"], serde_json::json!(22000));
+        assert_eq!(meta["generated_chars"], serde_json::json!(5000));
+    }
+
+    #[test]
+    fn test_metadata_omits_underfilled_reason_when_none() {
+        let meta = build_cheatsheet_metadata(
+            4,
+            4,
+            "complete",
+            2,
+            2,
+            0,
+            "default_cheatsheet.tex",
+            "/path/to/cheatsheet.md",
+            "note_patch_id",
+            22000,
+            23000,
+            1,
+            false,
+            2,
+            None,
+        );
+
+        assert!(meta.get("underfilled_reason").is_none());
+    }
+
+    #[test]
+    fn test_metadata_preserves_existing_keys() {
+        let meta = build_cheatsheet_metadata(
+            4,
+            4,
+            "complete",
+            3,
+            3,
+            1,
+            "custom.tex",
+            "/p/cheatsheet.md",
+            "rd_id",
+            33000,
+            31000,
+            2,
+            true,
+            3,
+            None,
+        );
+
+        assert_eq!(meta["progress_current"], serde_json::json!(4));
+        assert_eq!(meta["progress_total"], serde_json::json!(4));
+        assert_eq!(meta["progress_label"], serde_json::json!("complete"));
+        assert_eq!(meta["max_pages"], serde_json::json!(3));
+        assert_eq!(meta["page_count"], serde_json::json!(3));
+        assert_eq!(meta["compression_attempts"], serde_json::json!(1));
+        assert_eq!(meta["template_used"], serde_json::json!("custom.tex"));
+        assert_eq!(meta["markdown_path"], serde_json::json!("/p/cheatsheet.md"));
+        assert_eq!(
+            meta["reference_digest_output_id"],
+            serde_json::json!("rd_id")
+        );
+    }
+
+    #[test]
+    fn test_expansion_used_metadata_true() {
+        let meta = build_cheatsheet_metadata(
+            4,
+            4,
+            "complete",
+            2,
+            2,
+            0,
+            "default_cheatsheet.tex",
+            "/path/to/cheatsheet.md",
+            "reference_digest_id",
+            22000,
+            22000,
+            2,
+            true,
+            2,
+            None,
+        );
+
+        assert_eq!(meta["expansion_used"], serde_json::json!(true));
+        assert_eq!(meta["harness_attempts"], serde_json::json!(2));
+        assert_eq!(meta["final_page_count"], serde_json::json!(2));
     }
 }

@@ -201,12 +201,15 @@ function AddProcessDialog({ onClose, onCreated }: AddProcessDialogProps) {
     setSelectedOutputKinds((prev) => {
       const selected = prev.includes(kind);
       if (kind === 'note_patch') {
+        return selected ? prev.filter((x) => x !== kind) : [...prev, kind];
+      }
+      if (kind === 'reference_digest') {
         if (selected && prev.includes('cheating_sheet')) return prev;
         return selected ? prev.filter((x) => x !== kind) : [...prev, kind];
       }
       if (kind === 'cheating_sheet') {
         if (selected) return prev.filter((x) => x !== kind);
-        return Array.from(new Set([...prev, 'note_patch', 'cheating_sheet']));
+        return Array.from(new Set([...prev, 'reference_digest', 'cheating_sheet']));
       }
       return prev;
     });
@@ -317,11 +320,20 @@ function AddProcessDialog({ onClose, onCreated }: AddProcessDialogProps) {
                 control={
                   <Checkbox
                     checked={selectedOutputKinds.includes('note_patch')}
-                    disabled={selectedOutputKinds.includes('cheating_sheet')}
                     onChange={() => handleToggleOutput('note_patch')}
                   />
                 }
                 label="Note Patch"
+              />
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={selectedOutputKinds.includes('reference_digest')}
+                    disabled={selectedOutputKinds.includes('cheating_sheet')}
+                    onChange={() => handleToggleOutput('reference_digest')}
+                  />
+                }
+                label="Reference Digest"
               />
               <FormControlLabel
                 control={
@@ -349,7 +361,7 @@ function AddProcessDialog({ onClose, onCreated }: AddProcessDialogProps) {
             )}
             {selectedOutputKinds.includes('cheating_sheet') && (
               <Alert severity="info" sx={{ mt: 1 }}>
-                Cheating Sheet depends on Note Patch, so Note Patch is included automatically.
+                Cheating Sheet depends on Reference Digest, so Reference Digest is included automatically.
               </Alert>
             )}
           </Box>
@@ -394,6 +406,7 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
   const [addingOutput, setAddingOutput] = useState(false);
   const [addOutputError, setAddOutputError] = useState<string | null>(null);
   const [cheatingSheetMaxPages, setCheatingSheetMaxPages] = useState(2);
+  const [streamText, setStreamText] = useState<string | null>(null);
 
   const selectedOutput = process.outputs.find(
     (o) => o.id === selectedOutputId,
@@ -430,6 +443,26 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
     }, 3000);
     return () => clearInterval(timer);
   }, [process.status, selectedOutputId, onRefresh, loadOutputContent]);
+
+  // Auto-connect to SSE streaming when viewing a processing output.
+  useEffect(() => {
+    if (!selectedOutputId || selectedOutput?.status !== 'processing') {
+      setStreamText(null);
+      return;
+    }
+    setStreamText('');
+    const url = api.streamProcessOutputUrl(process.id, selectedOutputId);
+    const es = new EventSource(url);
+    es.addEventListener('chunk', (e: MessageEvent) => {
+      setStreamText((prev) => (prev ?? '') + e.data);
+    });
+    es.addEventListener('done', () => {
+      es.close();
+      onRefresh();
+    });
+    es.addEventListener('error', () => es.close());
+    return () => es.close();
+  }, [process.id, selectedOutputId, selectedOutput?.status, onRefresh]);
 
   const handleRevise = async () => {
     if (!selectedOutputId || !instruction.trim()) return;
@@ -479,7 +512,21 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
     }
   };
 
-  const handleAddOutput = async (kind: 'note_patch' | 'cheating_sheet') => {
+  const handleRetryOutput = async () => {
+    if (!selectedOutputId) return;
+    try {
+      const res = await api.retryProcessOutput(process.id, selectedOutputId);
+      if (res.error) {
+        setContentError('Failed to retry output: ' + res.error);
+      } else {
+        onRefresh();
+      }
+    } catch (e) {
+      setContentError('Failed to retry output: ' + String(e));
+    }
+  };
+
+  const handleAddOutput = async (kind: 'note_patch' | 'reference_digest' | 'cheating_sheet') => {
     setAddingOutput(true);
     setAddOutputError(null);
     try {
@@ -504,11 +551,15 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
   const hasNotePatch = process.outputs.some(
     (o) => o.kind === 'note_patch',
   );
+  const hasReferenceDigest = process.outputs.some(
+    (o) => o.kind === 'reference_digest',
+  );
   const hasCheatingSheet = process.outputs.some(
     (o) => o.kind === 'cheating_sheet',
   );
   const selectedProgress = outputProgress(selectedOutput);
   const selectedIsCheatingSheet = selectedOutput?.kind === 'cheating_sheet';
+  const selectedIsNotePatch = selectedOutput?.kind === 'note_patch';
 
   return (
     <Dialog open onClose={onClose} maxWidth="lg" fullWidth>
@@ -572,7 +623,7 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
                 sx={{ borderBottom: 1, borderColor: 'divider' }}
               >
                 <Tab label="Diff" disabled={!outputContent.has_base_note || selectedIsCheatingSheet} />
-                <Tab label={selectedIsCheatingSheet ? 'Source Markdown' : 'Markdown'} />
+                <Tab label={selectedIsCheatingSheet ? 'Source Markdown' : (selectedOutput?.kind === 'reference_digest' ? 'Digest Markdown' : 'Markdown')} />
               </Tabs>
 
               {/* Diff tab */}
@@ -588,9 +639,20 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
                     overflow: 'auto',
                   }}
                 >
-                  <Box className="markdown-body">
-                    <ReactMarkdown>{outputContent.markdown || '(empty markdown)'}</ReactMarkdown>
-                  </Box>
+                  {streamText !== null ? (
+                    <Box>
+                      <Chip label="Live" color="warning" size="small" sx={{ mb: 1 }} />
+                      <Box className="markdown-body">
+                        <ReactMarkdown>{streamText || '*Waiting for output...*'}</ReactMarkdown>
+                      </Box>
+                      <Box component="span" sx={{ animation: 'blink 1s infinite', color: 'warning.main' }}>▌</Box>
+                      <style>{`@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0; } }`}</style>
+                    </Box>
+                  ) : (
+                    <Box className="markdown-body">
+                      <ReactMarkdown>{outputContent.markdown || '(empty markdown)'}</ReactMarkdown>
+                    </Box>
+                  )}
                 </Paper>
               )}
 
@@ -635,8 +697,8 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
                 </Alert>
               )}
 
-              {/* Revision section */}
-              {!selectedIsCheatingSheet && (
+              {/* Revision section - only for Note Patch */}
+              {selectedIsNotePatch && (
               <Stack direction="row" spacing={1} alignItems="flex-start">
                 <TextField
                   fullWidth
@@ -667,16 +729,26 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
               {reviseError && <Alert severity="error">{reviseError}</Alert>}
 
               {/* Delete output */}
-              <Box>
+              <Stack direction="row" spacing={1}>
+                {selectedOutput.status === 'failed' && (
+                  <Button
+                    variant="outlined"
+                    color="warning"
+                    startIcon={<RefreshIcon />}
+                    onClick={handleRetryOutput}
+                  >
+                    Retry Output
+                  </Button>
+                )}
                 <Button
                   variant="outlined"
                   color="error"
                   startIcon={<DeleteIcon />}
-                onClick={handleDeleteOutput}
+                  onClick={handleDeleteOutput}
                 >
                   Delete Output
                 </Button>
-              </Box>
+              </Stack>
             </>
           ) : process.outputs.length === 0 ? (
             <Alert severity="info">
@@ -712,6 +784,29 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
               )}
             </Stack>
             <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
+              <Button
+                variant="outlined"
+                startIcon={
+                  addingOutput ? (
+                    <CircularProgress size={16} />
+                  ) : (
+                    <AddIcon />
+                  )
+                }
+                onClick={() => handleAddOutput('reference_digest')}
+                disabled={addingOutput || hasReferenceDigest}
+              >
+                {hasReferenceDigest
+                  ? 'Reference Digest already exists'
+                  : 'Add Reference Digest'}
+              </Button>
+              {hasReferenceDigest && (
+                <Typography variant="caption" color="text.secondary">
+                  Only one Reference Digest output is supported.
+                </Typography>
+              )}
+            </Stack>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
               <TextField
                 size="small"
                 type="number"
@@ -738,7 +833,7 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
                 {hasCheatingSheet ? 'Cheating Sheet already exists' : 'Add Cheating Sheet'}
               </Button>
               <Typography variant="caption" color="text.secondary">
-                Depends on Note Patch.
+                Depends on Reference Digest.
               </Typography>
             </Stack>
             {addOutputError && (
@@ -810,6 +905,23 @@ export default function Processing() {
     setLoading(true);
     loadProcesses();
   }, [loadProcesses]);
+
+  const handleRetryProcess = useCallback(
+    async (processId: string, force: boolean) => {
+      setError(null);
+      try {
+        const res = await api.retryProcess(processId, force);
+        if (res.error) {
+          setError('Retry failed: ' + res.error);
+        } else {
+          loadProcesses();
+        }
+      } catch (e) {
+        setError('Retry failed: ' + String(e));
+      }
+    },
+    [loadProcesses],
+  );
 
   return (
     <Box>
@@ -911,7 +1023,39 @@ export default function Processing() {
                 })()}
               </CardContent>
               <CardActions>
-                <Button size="small">View Details</Button>
+                <Button
+                  size="small"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedProcess(proc);
+                  }}
+                >
+                  View Details
+                </Button>
+                {proc.outputs.some((o) => o.status === 'failed') && (
+                  <Button
+                    size="small"
+                    color="warning"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRetryProcess(proc.id, false);
+                    }}
+                  >
+                    Retry Failed
+                  </Button>
+                )}
+                {proc.status !== 'processing' && (
+                  <Button
+                    size="small"
+                    color="error"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRetryProcess(proc.id, true);
+                    }}
+                  >
+                    Force Retry All
+                  </Button>
+                )}
               </CardActions>
             </Card>
           ))}

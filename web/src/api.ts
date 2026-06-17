@@ -81,7 +81,7 @@ export interface CourseDatesResponse {
 // Process types
 // ---------------------------------------------------------------------------
 
-export type ProcessOutputKind = 'note_patch' | 'cheating_sheet';
+export type ProcessOutputKind = 'note_patch' | 'reference_digest' | 'cheating_sheet';
 export type ProcessStatus = 'ready' | 'processing' | 'failed';
 
 export interface ProcessOutput {
@@ -585,6 +585,30 @@ class ApiClient {
         body: JSON.stringify({ instruction }),
       },
     );
+  }
+
+  async retryProcess(
+    processId: string,
+    force = false,
+  ): Promise<{ status: string; job_id?: string; retried_outputs?: string[]; message?: string; error?: string }> {
+    const params = force ? '?force=true' : '';
+    return this.fetch(`/api/processes/${processId}/retry${params}`, {
+      method: 'POST',
+    });
+  }
+
+  async retryProcessOutput(
+    processId: string,
+    outputId: string,
+  ): Promise<{ status: string; job_id?: string; error?: string }> {
+    return this.fetch(
+      `/api/processes/${processId}/outputs/${outputId}/retry`,
+      { method: 'POST' },
+    );
+  }
+
+  streamProcessOutputUrl(processId: string, outputId: string): string {
+    return `/api/processes/${encodeURIComponent(processId)}/outputs/${encodeURIComponent(outputId)}/stream`;
   }
 }
 

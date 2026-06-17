@@ -130,10 +130,7 @@ pub fn list_logs(limit: usize) -> Result<Vec<LogMeta>> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let ts = name
             .split('-')
             .next()
@@ -196,8 +193,7 @@ pub fn read_log(id: &str) -> Result<Value> {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read log file {}", path.display()))?;
-        let value: Value =
-            serde_json::from_str(&content).context("failed to parse log JSON")?;
+        let value: Value = serde_json::from_str(&content).context("failed to parse log JSON")?;
         // Exact match on the `id` field.
         if value.get("id").and_then(|v| v.as_str()) == Some(id) {
             return Ok(value);
@@ -263,7 +259,10 @@ mod tests {
         // Read full.
         let full = read_log("test-id-123").expect("read_log");
         assert_eq!(full["id"].as_str().unwrap(), "test-id-123");
-        assert_eq!(full["response"]["content"].as_str().unwrap(), "Hello, world!");
+        assert_eq!(
+            full["response"]["content"].as_str().unwrap(),
+            "Hello, world!"
+        );
 
         std::env::remove_var("LECTURE_DISTILL_LLM_LOG_DIR");
     }

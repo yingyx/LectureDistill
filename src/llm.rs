@@ -82,6 +82,17 @@ fn http_client() -> Result<Client> {
         .context("failed to create HTTP client")
 }
 
+/// Build a `reqwest::Client` with a generous timeout for large streaming
+/// responses (max_tokens ≥ 32 k).  Even at 20 tokens/s an 80 k response
+/// needs ~68 minutes, but in practice providers deliver much faster.
+/// 600 s is a safe upper bound for most deployments.
+fn http_client_streaming() -> Result<Client> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .context("failed to create streaming HTTP client")
+}
+
 async fn send_with_retries(
     client: &Client,
     url: &str,
@@ -186,6 +197,286 @@ fn json_parse_error_diagnostics(
     (error_msg, response_value)
 }
 
+/// Threshold above which non-streaming chat completions are routed through
+/// the SSE streaming endpoint internally.  This avoids HTTP transport failures
+/// (`error decoding response body`) that some API providers exhibit when
+/// delivering very large response bodies in a single chunk.
+const LARGE_OUTPUT_THRESHOLD: u32 = 32768;
+
+/// Internal helper: collect a streaming chat completion into a single result.
+///
+/// When `response_format` is `Some("json_object")`, the JSON constraint is
+/// enforced via the system prompt rather than the API parameter (which is
+/// incompatible with `stream: true`).  Code fences are stripped from the
+/// collected text before returning.
+///
+/// Returns `(accumulated_text, Option<finish_reason>)`.
+async fn chat_completion_via_stream(
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+    response_format: Option<&str>,
+    log_kind: &str,
+) -> Result<(String, Option<String>)> {
+    use futures_util::StreamExt;
+    let key = api_key()?;
+    let client = http_client_streaming()?;
+    let url = format!("{}/chat/completions", base_url());
+
+    let json_mode = response_format == Some("json_object");
+
+    // Build messages.  For JSON mode, inject a strong output constraint
+    // because the `response_format` API parameter is incompatible with
+    // `stream: true`.
+    let msgs: Vec<Value> = if json_mode {
+        let mut augmented: Vec<ChatMessage> = messages.to_vec();
+        // Append a system-level instruction if the first message is "system";
+        // otherwise prepend one.
+        if augmented.first().map(|m| m.role.as_str()) == Some("system") {
+            augmented[0].content = format!(
+                "{}\n\nYou MUST output ONLY valid JSON. No markdown fences, no explanatory text, no commentary. Just the JSON object.",
+                augmented[0].content
+            );
+        } else {
+            augmented.insert(
+                0,
+                ChatMessage {
+                    role: "system".into(),
+                    content:
+                        "You MUST output ONLY valid JSON. No markdown fences, no explanatory text, no commentary. Just the JSON object."
+                            .into(),
+                },
+            );
+        }
+        augmented
+            .iter()
+            .map(|m| json!({ "role": m.role, "content": m.content }))
+            .collect()
+    } else {
+        messages
+            .iter()
+            .map(|m| json!({ "role": m.role, "content": m.content }))
+            .collect()
+    };
+
+    let body = json!({
+        "model": model(),
+        "messages": msgs,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": true,
+    });
+
+    // --- LLM logging: capture context before the call ---
+    let log_id = Uuid::new_v4().to_string();
+    let log_created_at = Utc::now().to_rfc3339();
+    let log_started = std::time::Instant::now();
+    let log_model = model();
+    let log_base_url = base_url();
+    let log_request = body.clone();
+    let log_temp = temperature;
+    let log_max_tokens = max_tokens;
+    let log_rf = response_format.map(|s| s.to_string());
+    // ---------------------------------------------------
+
+    let resp = send_with_retries(
+        &client,
+        &url,
+        &key,
+        &body,
+        "chat completion (internal stream)",
+    )
+    .await;
+
+    let log_duration_ms = log_started.elapsed().as_millis() as u64;
+    let log_finished_at = Utc::now().to_rfc3339();
+
+    match resp {
+        Err(e) => {
+            crate::llm_log::write_log(crate::llm_log::LogEntry {
+                id: log_id,
+                created_at: log_created_at,
+                finished_at: log_finished_at,
+                duration_ms: log_duration_ms,
+                status: "failed".into(),
+                kind: log_kind.to_string(),
+                model: log_model,
+                base_url: log_base_url,
+                temperature: log_temp,
+                max_tokens: log_max_tokens,
+                response_format: log_rf.clone(),
+                request: log_request,
+                response: None,
+                error: Some(e.to_string()),
+            });
+            Err(e)
+        }
+        Ok(resp) => {
+            let mut stream = resp.bytes_stream();
+            let mut buf = String::new();
+            let mut accumulated = String::new();
+            let mut finish_reason: Option<String> = None;
+
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(line_end) = buf.find('\n') {
+                            let line = buf[..line_end].trim().to_string();
+                            buf = buf[line_end + 1..].to_string();
+                            if line.is_empty() || line.starts_with(':') {
+                                continue;
+                            }
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data == "[DONE]" {
+                                    // Strip JSON fences if needed before returning.
+                                    let final_text = if json_mode {
+                                        strip_fences_for_json_mode(&accumulated)
+                                    } else {
+                                        accumulated
+                                    };
+                                    // Success — log and return.
+                                    crate::llm_log::write_log(crate::llm_log::LogEntry {
+                                        id: log_id,
+                                        created_at: log_created_at,
+                                        finished_at: log_finished_at.clone(),
+                                        duration_ms: log_duration_ms,
+                                        status: "succeeded".into(),
+                                        kind: log_kind.to_string(),
+                                        model: log_model,
+                                        base_url: log_base_url,
+                                        temperature: log_temp,
+                                        max_tokens: log_max_tokens,
+                                        response_format: log_rf.clone(),
+                                        request: log_request,
+                                        response: Some(
+                                            json!({ "content": final_text, "finish_reason": finish_reason }),
+                                        ),
+                                        error: None,
+                                    });
+                                    return Ok((final_text, finish_reason));
+                                }
+                                match serde_json::from_str::<Value>(data) {
+                                    Ok(parsed) => {
+                                        // Capture finish_reason from the last choice delta.
+                                        if let Some(fr) =
+                                            parsed["choices"][0]["finish_reason"].as_str()
+                                        {
+                                            if !fr.is_empty() {
+                                                finish_reason = Some(fr.to_string());
+                                            }
+                                        }
+                                        if let Some(delta) =
+                                            parsed["choices"][0]["delta"]["content"].as_str()
+                                        {
+                                            accumulated.push_str(delta);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err_msg = format!("Failed to parse SSE data: {}", e);
+                                        crate::llm_log::write_log(crate::llm_log::LogEntry {
+                                            id: log_id,
+                                            created_at: log_created_at,
+                                            finished_at: log_finished_at,
+                                            duration_ms: log_duration_ms,
+                                            status: "failed".into(),
+                                            kind: log_kind.to_string(),
+                                            model: log_model,
+                                            base_url: log_base_url,
+                                            temperature: log_temp,
+                                            max_tokens: log_max_tokens,
+                                            response_format: log_rf.clone(),
+                                            request: log_request,
+                                            response: Some(
+                                                json!({ "partial_content": accumulated }),
+                                            ),
+                                            error: Some(err_msg.clone()),
+                                        });
+                                        return Err(anyhow::anyhow!("{}", err_msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // Stream error — return what we have if any, else error.
+                        if accumulated.is_empty() {
+                            let err_msg = format!("Stream error: {}", e);
+                            crate::llm_log::write_log(crate::llm_log::LogEntry {
+                                id: log_id,
+                                created_at: log_created_at,
+                                finished_at: log_finished_at,
+                                duration_ms: log_duration_ms,
+                                status: "failed".into(),
+                                kind: log_kind.to_string(),
+                                model: log_model,
+                                base_url: log_base_url,
+                                temperature: log_temp,
+                                max_tokens: log_max_tokens,
+                                response_format: log_rf.clone(),
+                                request: log_request,
+                                response: None,
+                                error: Some(err_msg.clone()),
+                            });
+                            return Err(anyhow::anyhow!("{}", err_msg));
+                        }
+                        // Partial success — log warning but return what we have.
+                        log::warn!(
+                            "chat completion stream interrupted after {} chars: {}",
+                            accumulated.chars().count(),
+                            e
+                        );
+                        crate::llm_log::write_log(crate::llm_log::LogEntry {
+                            id: log_id,
+                            created_at: log_created_at,
+                            finished_at: log_finished_at,
+                            duration_ms: log_duration_ms,
+                            status: "partial".into(),
+                            kind: log_kind.to_string(),
+                            model: log_model,
+                            base_url: log_base_url,
+                            temperature: log_temp,
+                            max_tokens: log_max_tokens,
+                            response_format: log_rf.clone(),
+                            request: log_request,
+                            response: Some(json!({ "partial_content": accumulated })),
+                            error: Some(format!("Stream interrupted: {}", e)),
+                        });
+                        return Ok((accumulated, finish_reason));
+                    }
+                    None => {
+                        // Stream ended without [DONE] — return what we collected.
+                        let final_text = if json_mode {
+                            strip_fences_for_json_mode(&accumulated)
+                        } else {
+                            accumulated
+                        };
+                        crate::llm_log::write_log(crate::llm_log::LogEntry {
+                            id: log_id,
+                            created_at: log_created_at,
+                            finished_at: log_finished_at,
+                            duration_ms: log_duration_ms,
+                            status: "succeeded".into(),
+                            kind: log_kind.to_string(),
+                            model: log_model,
+                            base_url: log_base_url,
+                            temperature: log_temp,
+                            max_tokens: log_max_tokens,
+                            response_format: log_rf.clone(),
+                            request: log_request,
+                            response: Some(
+                                json!({ "content": final_text, "finish_reason": finish_reason }),
+                            ),
+                            error: None,
+                        });
+                        return Ok((final_text, finish_reason));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Send a chat completion request and return the text content of the first
 /// choice.
 ///
@@ -204,12 +495,46 @@ fn json_parse_error_diagnostics(
 /// * `max_tokens` - maximum tokens in the response.
 /// * `response_format` - pass `Some("json_object")` to force JSON output,
 ///   or `None` for plain text.
+///
+/// When `max_tokens` equals or exceeds [`LARGE_OUTPUT_THRESHOLD`] and
+/// `response_format` is `None`, this function internally uses SSE streaming
+/// to avoid HTTP transport failures on very large response bodies.
 pub async fn chat_completion(
     messages: &[ChatMessage],
     temperature: f32,
     max_tokens: u32,
     response_format: Option<&str>,
 ) -> Result<String> {
+    // Route large outputs through internal streaming to avoid HTTP transport
+    // failures on very large response bodies.  On failure, retry with
+    // progressively smaller max_tokens as a last-resort fallback.
+    if max_tokens >= LARGE_OUTPUT_THRESHOLD {
+        let _permit = acquire_llm_permit().await?;
+        let mut mt = max_tokens;
+        loop {
+            match chat_completion_via_stream(
+                messages,
+                temperature,
+                mt,
+                response_format,
+                "chat_completion",
+            )
+            .await
+            {
+                Ok((text, _)) => return Ok(text),
+                Err(e) if mt > 16384 => {
+                    mt /= 2;
+                    log::warn!(
+                        "chat_completion streaming failed at max_tokens={}, retrying with {}: {}",
+                        max_tokens,
+                        mt,
+                        e
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     let _permit = acquire_llm_permit().await?;
     let key = api_key()?;
     let client = http_client()?;
@@ -300,11 +625,8 @@ pub async fn chat_completion(
                         }
                     }
                     Err(parse_err) => {
-                        let (err_msg, response_value) = json_parse_error_diagnostics(
-                            http_status,
-                            &body_text,
-                            &parse_err,
-                        );
+                        let (err_msg, response_value) =
+                            json_parse_error_diagnostics(http_status, &body_text, &parse_err);
                         crate::llm_log::write_log(crate::llm_log::LogEntry {
                             id: log_id,
                             created_at: log_created_at,
@@ -348,7 +670,7 @@ pub async fn chat_completion(
                     Err(anyhow::anyhow!("{}", err_msg))
                 }
             }
-        },
+        }
         Err(e) => {
             crate::llm_log::write_log(crate::llm_log::LogEntry {
                 id: log_id,
@@ -384,6 +706,37 @@ pub async fn chat_completion_with_metadata(
     max_tokens: u32,
     response_format: Option<&str>,
 ) -> Result<(String, Option<String>)> {
+    // Route large outputs through internal streaming to avoid HTTP transport
+    // failures on very large response bodies.  On failure, retry with
+    // progressively smaller max_tokens.
+    if max_tokens >= LARGE_OUTPUT_THRESHOLD {
+        let _permit = acquire_llm_permit().await?;
+        let mut mt = max_tokens;
+        loop {
+            match chat_completion_via_stream(
+                messages,
+                temperature,
+                mt,
+                response_format,
+                "chat_completion_with_metadata",
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) if mt > 16384 => {
+                    mt /= 2;
+                    log::warn!(
+                        "chat_completion_with_metadata streaming failed at max_tokens={}, retrying with {}: {}",
+                        max_tokens,
+                        mt,
+                        e
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     let _permit = acquire_llm_permit().await?;
     let key = api_key()?;
     let client = http_client()?;
@@ -446,7 +799,9 @@ pub async fn chat_completion_with_metadata(
                                     max_tokens: log_max_tokens,
                                     response_format: log_rf,
                                     request: log_request,
-                                    response: Some(json!({ "raw": json, "content": content, "finish_reason": finish_reason })),
+                                    response: Some(
+                                        json!({ "raw": json, "content": content, "finish_reason": finish_reason }),
+                                    ),
                                     error: None,
                                 });
                                 Ok((content.to_string(), finish_reason))
@@ -476,11 +831,8 @@ pub async fn chat_completion_with_metadata(
                         }
                     }
                     Err(parse_err) => {
-                        let (err_msg, response_value) = json_parse_error_diagnostics(
-                            http_status,
-                            &body_text,
-                            &parse_err,
-                        );
+                        let (err_msg, response_value) =
+                            json_parse_error_diagnostics(http_status, &body_text, &parse_err);
                         crate::llm_log::write_log(crate::llm_log::LogEntry {
                             id: log_id,
                             created_at: log_created_at,
@@ -524,7 +876,7 @@ pub async fn chat_completion_with_metadata(
                     Err(anyhow::anyhow!("{}", err_msg))
                 }
             }
-        },
+        }
         Err(e) => {
             crate::llm_log::write_log(crate::llm_log::LogEntry {
                 id: log_id,
@@ -666,8 +1018,7 @@ pub async fn chat_completion_stream(
     let log_max_tokens = max_tokens;
     // ---------------------------------------------------
 
-    let resp =
-        send_with_retries(&client, &url, &key, &body, "streaming chat completion").await;
+    let resp = send_with_retries(&client, &url, &key, &body, "streaming chat completion").await;
 
     match resp {
         Err(e) => {
@@ -702,9 +1053,7 @@ pub async fn chat_completion_stream(
                 let mut accumulated = String::new(); // accumulate for logging
 
                 // Helper to write the log from inside the spawned task.
-                let write_stream_log = |status: &str,
-                                        content: &str,
-                                        error: Option<String>| {
+                let write_stream_log = |status: &str, content: &str, error: Option<String>| {
                     let log_duration_ms = log_started.elapsed().as_millis() as u64;
                     let log_finished_at = Utc::now().to_rfc3339();
                     crate::llm_log::write_log(crate::llm_log::LogEntry {
@@ -749,8 +1098,7 @@ pub async fn chat_completion_stream(
                                     match serde_json::from_str::<Value>(data) {
                                         Ok(parsed) => {
                                             if let Some(delta) =
-                                                parsed["choices"][0]["delta"]["content"]
-                                                    .as_str()
+                                                parsed["choices"][0]["delta"]["content"].as_str()
                                             {
                                                 let content = delta.to_string();
                                                 if !content.is_empty() {
@@ -770,14 +1118,9 @@ pub async fn chat_completion_stream(
                                         Err(e) => {
                                             let err_msg =
                                                 format!("Failed to parse SSE data: {}", e);
-                                            let _ = tx
-                                                .send(Err(anyhow::anyhow!("{}", &err_msg)))
-                                                .await;
-                                            write_stream_log(
-                                                "failed",
-                                                &accumulated,
-                                                Some(err_msg),
-                                            );
+                                            let _ =
+                                                tx.send(Err(anyhow::anyhow!("{}", &err_msg))).await;
+                                            write_stream_log("failed", &accumulated, Some(err_msg));
                                             return;
                                         }
                                     }
@@ -786,9 +1129,7 @@ pub async fn chat_completion_stream(
                         }
                         Err(e) => {
                             let err_msg = format!("Stream error: {}", e);
-                            let _ = tx
-                                .send(Err(anyhow::anyhow!("{}", &err_msg)))
-                                .await;
+                            let _ = tx.send(Err(anyhow::anyhow!("{}", &err_msg))).await;
                             write_stream_log("failed", &accumulated, Some(err_msg));
                             return;
                         }
@@ -921,6 +1262,23 @@ pub fn compact_transcript_for_llm(text: &str, max_chars: usize) -> String {
 
 /// Strip markdown code fences (```` ```json ```` / ```` ``` ````) from LLM
 /// output, then attempt JSON parsing.
+/// Strip markdown code fences from JSON output.
+///
+/// In streaming mode we cannot use `response_format: "json_object"`, so the LLM
+/// may wrap its output in ```json ... ``` fences.  This helper strips them
+/// before the text is handed to JSON-aware callers (e.g. outline parsers in
+/// `app.rs`).
+fn strip_fences_for_json_mode(text: &str) -> String {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix("```json") {
+        rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
+    } else if let Some(rest) = text.strip_prefix("```") {
+        rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 fn strip_code_fences_and_parse(text: &str) -> Result<Value, serde_json::Error> {
     let text = text.trim();
 
