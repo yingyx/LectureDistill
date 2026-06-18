@@ -610,6 +610,10 @@ class ApiClient {
   streamProcessOutputUrl(processId: string, outputId: string): string {
     return `/api/processes/${encodeURIComponent(processId)}/outputs/${encodeURIComponent(outputId)}/stream`;
   }
+
+  getProcessOutputFileUrl(processId: string, outputId: string): string {
+    return `/api/processes/${encodeURIComponent(processId)}/outputs/${encodeURIComponent(outputId)}/file`;
+  }
 }
 
 export const api = new ApiClient();

@@ -212,6 +212,10 @@ pub fn create_app(project_dir: &str) -> Router {
             "/api/processes/{id}/outputs/{output_id}/stream",
             get(api_stream_process_output),
         )
+        .route(
+            "/api/processes/{id}/outputs/{output_id}/file",
+            get(api_get_process_output_file),
+        )
         // ------------------------------------------------------------------
         // Canvas LMS courses API
         // ------------------------------------------------------------------
@@ -4164,7 +4168,14 @@ async fn api_stream_process_output(
                         Some(o) => fs::read_to_string(&o.path).unwrap_or_default(),
                         None => return Err(anyhow::anyhow!("Cheat Sheet requires a completed Reference Digest")),
                     };
-                    let (sys, usr) = build_cheat_sheet_prompts(&digest_md, 2);
+                    let max_pages = output
+                        .metadata
+                        .get("max_pages")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(2)
+                        .clamp(1, 20);
+                    let (sys, usr) = build_cheat_sheet_prompts(&digest_md, max_pages);
                     let rx = crate::llm::chat_text_stream(&sys, &usr, 0.2, 65536).await?;
                     Ok(("cheat_sheet".to_string(), rx))
                 }
@@ -6815,6 +6826,12 @@ async fn run_cheating_sheet_outputs(
         let budget = estimate_cheating_sheet_budget(max_pages);
         let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
 
+        web_log(format!(
+            "job {} cheating-sheet: budget max_pages={} target={} soft_max={} min_acceptable={} ref_digest_chars={} source_too_short={}",
+            job_id, max_pages, budget.target_chars, budget.soft_max_chars,
+            budget.min_acceptable_chars, ref_digest_chars, source_too_short,
+        ));
+
         let gen_result = match generate_cheating_sheet_markdown(&ref_digest_markdown, max_pages)
             .await
         {
@@ -6902,14 +6919,28 @@ async fn run_cheating_sheet_outputs(
 
         // Determine if expansion is needed.
         let should_expand = match &render_result {
-            Ok(artifact) => should_attempt_expansion(
-                gen_result.generated_chars,
-                budget.min_acceptable_chars,
-                artifact.page_count,
-                max_pages,
-                source_too_short,
-            ),
-            Err(_) => false, // Don't expand if first render failed.
+            Ok(artifact) => {
+                let decision = should_attempt_expansion(
+                    gen_result.generated_chars,
+                    budget.min_acceptable_chars,
+                    artifact.page_count,
+                    max_pages,
+                    source_too_short,
+                );
+                web_log(format!(
+                    "job {} cheating-sheet: first render page_count={} max_pages={} generated_chars={} source_too_short={} -> expand={}",
+                    job_id, artifact.page_count, max_pages, gen_result.generated_chars,
+                    source_too_short, decision,
+                ));
+                decision
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} cheating-sheet: first render FAILED: {} — skipping expansion",
+                    job_id, e,
+                ));
+                false
+            }
         };
 
         let (final_result, expansion_used, final_page_count) = if should_expand {
@@ -6926,6 +6957,11 @@ async fn run_cheating_sheet_outputs(
             let target_add_chars = (budget.target_chars.saturating_sub(current_chars))
                 .min(6000)
                 .max(2000);
+
+            web_log(format!(
+                "job {} cheating-sheet: expansion triggered — current_chars={} target_chars={} target_add_chars={}",
+                job_id, current_chars, budget.target_chars, target_add_chars,
+            ));
             let (_sections, inventory) = build_section_inventory(&ref_digest_markdown);
             let ref_digest_excerpt =
                 truncate_ref_digest_for_cheatsheet(&ref_digest_markdown, 90000).0;
@@ -7006,6 +7042,12 @@ async fn run_cheating_sheet_outputs(
             } else {
                 None
             };
+            if let Some(ref reason) = underfilled_reason {
+                web_log(format!(
+                    "job {} cheating-sheet: expansion skipped — reason={} ref_digest_chars={} min_acceptable={}",
+                    job_id, reason, ref_digest_chars, budget.min_acceptable_chars,
+                ));
+            }
             let mut result = gen_result;
             result.underfilled_reason = underfilled_reason;
             (result, false, page_count)
@@ -7627,6 +7669,70 @@ async fn api_get_process_output(
         "artifact_path": output.path,
     }))
     .into_response()
+}
+
+/// `GET /api/processes/{id}/outputs/{output_id}/file` — serve the output file (PDF etc.).
+async fn api_get_process_output_file(
+    State(state): State<AppState>,
+    Path((process_id, output_id)): Path<(String, String)>,
+) -> Response {
+    let process = match state.process_store.get(&process_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Process not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let output = match process.outputs.iter().find(|o| o.id == output_id) {
+        Some(o) => o,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Output not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let file_path = &output.path;
+    if file_path.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Output file path is empty"})),
+        )
+            .into_response();
+    }
+
+    let bytes = match fs::read(file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Failed to read output file: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let content_type = match std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some("pdf") => "application/pdf",
+        Some("tex") | Some("typ") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, content_type)],
+        bytes,
+    )
+        .into_response()
 }
 
 /// `POST /api/processes/{id}/outputs` -- add an output method to a process.

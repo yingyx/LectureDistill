@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   api,
   type ProcessRecord,
@@ -418,8 +418,7 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
     try {
       const content = await api.getProcessOutput(process.id, outputId);
       setOutputContent(content);
-      // Default to Diff tab if has_base_note, otherwise Markdown tab.
-      if (!quiet) setTabIndex(content.output.kind === 'cheating_sheet' ? 1 : content.has_base_note ? 0 : 1);
+      if (!quiet) setTabIndex(0);
     } catch (e) {
       setContentError(String(e));
     } finally {
@@ -617,44 +616,80 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
             <Alert severity="error">{contentError}</Alert>
           ) : selectedOutput && outputContent ? (
             <>
-              <Tabs
-                value={tabIndex}
-                onChange={(_, v) => setTabIndex(v)}
-                sx={{ borderBottom: 1, borderColor: 'divider' }}
-              >
-                <Tab label="Diff" disabled={!outputContent.has_base_note || selectedIsCheatingSheet} />
-                <Tab label={selectedIsCheatingSheet ? 'Source Markdown' : (selectedOutput?.kind === 'reference_digest' ? 'Digest Markdown' : 'Markdown')} />
-              </Tabs>
+              {(() => {
+                // Dynamic tab definitions based on output kind.
+                type TabDef = { label: string; key: string; disabled?: boolean };
+                const tabs: TabDef[] = [];
+                if (selectedOutput?.kind === 'cheating_sheet') {
+                  tabs.push({ label: 'Source Markdown', key: 'markdown' });
+                  tabs.push({
+                    label: 'PDF Preview',
+                    key: 'pdf',
+                    disabled: !outputContent.artifact_path || selectedOutput.status !== 'ready',
+                  });
+                } else if (selectedOutput?.kind === 'reference_digest') {
+                  tabs.push({ label: 'Digest Markdown', key: 'markdown' });
+                } else {
+                  // NotePatch
+                  if (outputContent.has_base_note) {
+                    tabs.push({ label: 'Diff', key: 'diff' });
+                  }
+                  tabs.push({ label: 'Markdown', key: 'markdown' });
+                }
 
-              {/* Diff tab */}
-              {tabIndex === 0 && <DiffView diff={outputContent.diff} />}
+                const activeKey = tabIndex < tabs.length ? tabs[tabIndex].key : (tabs[0]?.key ?? 'markdown');
 
-              {/* Markdown tab */}
-              {tabIndex === 1 && (
-                <Paper
-                  variant="outlined"
-                  sx={{
-                    p: 2,
-                    maxHeight: 400,
-                    overflow: 'auto',
-                  }}
-                >
-                  {streamText !== null ? (
-                    <Box>
-                      <Chip label="Live" color="warning" size="small" sx={{ mb: 1 }} />
-                      <Box className="markdown-body">
-                        <ReactMarkdown>{streamText || '*Waiting for output...*'}</ReactMarkdown>
-                      </Box>
-                      <Box component="span" sx={{ animation: 'blink 1s infinite', color: 'warning.main' }}>▌</Box>
-                      <style>{`@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0; } }`}</style>
-                    </Box>
-                  ) : (
-                    <Box className="markdown-body">
-                      <ReactMarkdown>{outputContent.markdown || '(empty markdown)'}</ReactMarkdown>
-                    </Box>
-                  )}
-                </Paper>
-              )}
+                return (
+                  <>
+                    <Tabs
+                      value={tabIndex}
+                      onChange={(_, v) => setTabIndex(v)}
+                      sx={{ borderBottom: 1, borderColor: 'divider' }}
+                    >
+                      {tabs.map((tab, idx) => (
+                        <Tab key={tab.key} label={tab.label} disabled={tab.disabled} value={idx} />
+                      ))}
+                    </Tabs>
+
+                    {/* Diff tab */}
+                    {activeKey === 'diff' && <DiffView diff={outputContent.diff} />}
+
+                    {/* Markdown tab */}
+                    {activeKey === 'markdown' && (
+                      <Paper
+                        variant="outlined"
+                        sx={{ p: 2, maxHeight: 400, overflow: 'auto' }}
+                      >
+                        {streamText !== null ? (
+                          <Box>
+                            <Chip label="Live" color="warning" size="small" sx={{ mb: 1 }} />
+                            <Box className="markdown-body">
+                              <ReactMarkdown>{streamText || '*Waiting for output...*'}</ReactMarkdown>
+                            </Box>
+                            <Box component="span" sx={{ animation: 'blink 1s infinite', color: 'warning.main' }}>▌</Box>
+                            <style>{`@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0; } }`}</style>
+                          </Box>
+                        ) : (
+                          <Box className="markdown-body">
+                            <ReactMarkdown>{outputContent.markdown || '(empty markdown)'}</ReactMarkdown>
+                          </Box>
+                        )}
+                      </Paper>
+                    )}
+
+                    {/* PDF preview tab */}
+                    {activeKey === 'pdf' && outputContent.artifact_path && (
+                      <Paper variant="outlined" sx={{ height: 600, overflow: 'hidden' }}>
+                        <iframe
+                          src={api.getProcessOutputFileUrl(process.id, selectedOutputId!)}
+                          title="PDF Preview"
+                          style={{ width: '100%', height: '100%', border: 'none' }}
+                        />
+                      </Paper>
+                    )}
+                  </>
+                );
+              })()}
 
               {outputContent.retrieval && outputContent.retrieval.length > 0 && (
                 <Paper variant="outlined" sx={{ p: 2 }}>

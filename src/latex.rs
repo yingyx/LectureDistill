@@ -453,39 +453,18 @@ pub fn compress_content(content: &str, attempt: usize) -> String {
                 .join("\n")
         }
         2 => {
-            let result = remove_h2_sections(content, &["Supporting Concepts"]);
-            // Clean up: collapse multiple blank lines.
+            // Keep all h2 sections but truncate each body to ~65 % of original length.
+            // This preserves topic coverage while reducing total content.
+            let result = truncate_all_h2_sections(content, 2, 3);
+            // Also remove "Supporting Concepts" h2 sections when present (Ref Digest).
+            let result = remove_h2_sections(&result, &["Supporting Concepts"]);
             let re_blank = Regex::new(r"\n{3,}").unwrap();
             re_blank.replace_all(&result, "\n\n").to_string()
         }
         3 => {
-            // Keep only "## Key Concepts" and "## Content Summary" sections.
-            let mut output = String::new();
-
-            // Copy preamble (everything before the first "## " heading, typically
-            // the title line).
-            if let Some(first_h2) = content.find("\n## ") {
-                let preamble = &content[..first_h2];
-                output.push_str(preamble.trim_end());
-                output.push_str("\n\n");
-            } else {
-                // No h2 headings at all - keep 50%.
-                return take_char_fraction(content, 1, 2);
-            }
-
-            let sections = keep_h2_sections(content, &["Key Concepts", "Content Summary"]);
-            let found = !sections.trim().is_empty();
-            output.push_str(sections.trim_end());
-            if found {
-                output.push_str("\n\n");
-            }
-
-            if !found {
-                // Fallback: truncate to first 50%.
-                return take_char_fraction(content, 1, 2);
-            }
-
-            output.trim_end().to_string()
+            // Aggressive: keep all h2 sections but truncate each body to ~40 %.
+            // Every topic survives — no hard character cutoff.
+            truncate_all_h2_sections(content, 2, 5)
         }
         _ => content.to_string(), // attempt 0 or unknown - no compression
     }
@@ -514,24 +493,6 @@ fn remove_h2_sections(content: &str, prefixes: &[&str]) -> String {
     out.join("\n")
 }
 
-fn keep_h2_sections(content: &str, prefixes: &[&str]) -> String {
-    let mut out = Vec::new();
-    let mut keeping = false;
-
-    for line in content.lines() {
-        if line.starts_with("## ") {
-            keeping = h2_heading_matches(line, prefixes);
-        } else if line.starts_with("# ") {
-            keeping = false;
-        }
-        if keeping {
-            out.push(line);
-        }
-    }
-
-    out.join("\n")
-}
-
 fn take_char_fraction(content: &str, numerator: usize, denominator: usize) -> String {
     if denominator == 0 || content.is_empty() {
         return String::new();
@@ -539,6 +500,72 @@ fn take_char_fraction(content: &str, numerator: usize, denominator: usize) -> St
     let char_count = content.chars().count();
     let take_count = (char_count.saturating_mul(numerator) / denominator).max(1);
     content.chars().take(take_count).collect()
+}
+
+/// Truncate every h2 section body proportionally so all topics survive.
+///
+/// Splits at `\n## ` boundaries, keeps preamble and all section headings intact,
+/// and truncates each section body to `fraction_numer / fraction_denom` of its
+/// original length (minimum 200 chars per section).  If no h2 headings exist,
+/// falls back to global `take_char_fraction`.
+fn truncate_all_h2_sections(content: &str, fraction_numer: usize, fraction_denom: usize) -> String {
+    // Find the first "\n## " that starts a real h2 section.
+    let first_h2 = match content.find("\n## ") {
+        Some(pos) => pos,
+        None => return take_char_fraction(content, fraction_numer, fraction_denom),
+    };
+
+    let preamble = &content[..first_h2];
+    let mut result = String::with_capacity(content.len());
+    result.push_str(preamble.trim_end());
+    result.push('\n');
+
+    // Split remaining content on "\n## " to get individual sections.
+    let body = &content[first_h2 + 1..]; // skip the leading \n
+    let sections: Vec<&str> = body.split("\n## ").collect();
+
+    let total_section_chars: usize = sections.iter().map(|s| s.chars().count()).sum();
+    if total_section_chars == 0 {
+        return result;
+    }
+
+    // Compute total char budget for all section bodies.
+    let total_budget = (total_section_chars.saturating_mul(fraction_numer) / fraction_denom)
+        .max(sections.len().saturating_mul(200));
+
+    for section in &sections {
+        let heading_end = section.find('\n').unwrap_or(section.len());
+        let heading = &section[..heading_end];
+        let body_start = if heading_end < section.len() {
+            heading_end + 1
+        } else {
+            heading_end
+        };
+        let body_text = &section[body_start..];
+        let body_chars = body_text.chars().count();
+
+        // Proportional allocation with a floor of 200 chars.
+        let alloc = if total_section_chars > 0 {
+            ((body_chars as u64 * total_budget as u64) / total_section_chars as u64)
+                .min(usize::MAX as u64) as usize
+        } else {
+            200
+        }
+        .max(200);
+
+        result.push_str("## ");
+        result.push_str(heading);
+        result.push('\n');
+        if body_chars > 0 && alloc > 0 {
+            let truncated: String = body_text.chars().take(alloc).collect();
+            result.push_str(truncated.trim_end());
+        }
+        result.push_str("\n\n");
+    }
+
+    // Collapse consecutive blank lines.
+    let re_blank = Regex::new(r"\n{3,}").unwrap();
+    re_blank.replace_all(result.trim_end(), "\n\n").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1487,6 +1514,7 @@ intro text
 
 ## Key Concepts (Must Know)
 - concept A
+- concept B
 
 ## Supporting Concepts (Understand)
 - support B
@@ -1496,45 +1524,54 @@ intro text
 content here
 ";
         let output = compress_content(input, 2);
+        // Still removes "Supporting Concepts" sections (Ref Digest optimisation).
         assert!(output.contains("Key Concepts"));
         assert!(!output.contains("Supporting Concepts"));
         assert!(!output.contains("support B"));
         assert!(output.contains("Content Summary"));
+        // Other sections survive (proportional truncation preserves all non-dropped h2s).
     }
 
     #[test]
-    fn compress_content_attempt3_keeps_only_key_sections() {
-        let input = "\
-# Title
-intro text
-
-## Key Concepts (Must Know)
-- concept A
-
-## Supporting Concepts (Understand)
-- support B
-
-## Content Summary
-content here
-";
-        let output = compress_content(input, 3);
+    fn compress_content_attempt3_preserves_all_h2_sections() {
+        // Use a longer input so proportional truncation visibly reduces output.
+        let concept_a = "- concept A detail\n".repeat(20);
+        let support_b = "- support detail\n".repeat(15);
+        let content = "content paragraph.\n".repeat(18);
+        let extra = "more content here.\n".repeat(12);
+        let input = format!(
+            "# Title\nintro text\n\n## Key Concepts (Must Know)\n{}\n## Supporting Concepts (Understand)\n{}\n## Content Summary\n{}\n## Additional Topic\n{}\n",
+            concept_a, support_b, content, extra
+        );
+        let output = compress_content(&input, 3);
+        // All h2 sections survive — proportional truncation, no hard cutoff.
         assert!(output.contains("Key Concepts"));
-        assert!(!output.contains("Supporting Concepts"));
-        assert!(!output.contains("support B"));
+        assert!(output.contains("Supporting Concepts"));
         assert!(output.contains("Content Summary"));
+        assert!(output.contains("Additional Topic"));
+        // Output should be meaningfully shorter than input (truncated to ~40 %,
+        // but 200‑char per‑section floor limits shrinkage for short inputs).
+        assert!(
+            output.len() <= input.len() * 8 / 10,
+            "expected output <= 80 % of input (got {} vs {} chars)",
+            output.len(),
+            input.len()
+        );
     }
 
     #[test]
-    fn compress_content_attempt3_fallback() {
+    fn compress_content_attempt3_no_h2_headings_falls_back_to_take_char_fraction() {
+        // Content without any "\n## " headings → falls back to global proportional truncation.
         let input = "# Title\n\nSome content without expected sections.\nMore content here.";
         let output = compress_content(input, 3);
-        // Fallback: should contain roughly first 50%.
+        // Fallback: take_char_fraction(content, 2, 5) — roughly 40 % of chars.
         assert!(!output.is_empty());
         assert!(output.len() <= input.len());
+        assert!(output.contains("Title"));
     }
 
     #[test]
-    fn compress_content_attempt3_fallback_is_utf8_safe() {
+    fn compress_content_attempt3_is_utf8_safe() {
         let input =
             "# 信号与系统 大作业速查\n\n同步解调误差分析需要考虑相位差、频偏差和低通滤波器带宽。";
         let output = compress_content(input, 3);
