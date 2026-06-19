@@ -9,8 +9,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -20,10 +23,175 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// A single chat message with an OpenAI-compatible role and content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn conversation with prefix-caching support
+// ---------------------------------------------------------------------------
+
+/// A multi-turn conversation that accumulates message history across turns.
+///
+/// DeepSeek's disk-based prefix caching automatically reuses KV states for
+/// matching message prefixes.  Because every [`turn`] call sends the full
+/// accumulated history, long-lived content (transcripts, Reference Digest)
+/// only needs to be encoded once — subsequent turns hit the cache.
+///
+/// Conversations can be persisted to disk via [`save_to_file`] and restored
+/// via [`load_from_file`] so that retries of downstream steps (Cheat Sheet,
+/// Expansion) can continue the conversation instead of starting fresh.
+///
+/// [`turn`]: ChatConversation::turn
+/// [`save_to_file`]: ChatConversation::save_to_file
+/// [`load_from_file`]: ChatConversation::load_from_file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConversation {
+    messages: Vec<ChatMessage>,
+    /// Model name used when this conversation was created (for compatibility).
+    #[serde(default)]
+    model: String,
+    /// Base URL used when this conversation was created (for compatibility).
+    #[serde(default)]
+    base_url: String,
+}
+
+impl ChatConversation {
+    /// Create a new conversation with the given system prompt.
+    ///
+    /// Records the current model and base URL for compatibility checks when
+    /// the conversation is later restored from disk.
+    pub fn new(system_prompt: &str) -> Self {
+        Self {
+            messages: vec![ChatMessage {
+                role: "system".into(),
+                content: system_prompt.to_string(),
+            }],
+            model: model(),
+            base_url: base_url(),
+        }
+    }
+
+    /// Return a reference to all messages in the conversation.
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    /// Create an independent fork of this conversation.
+    ///
+    /// The fork shares the same message history up to the fork point but can
+    /// diverge independently.  Use this when you need per-output branches
+    /// (e.g. one cheat-sheet output per `max_pages` value) while keeping the
+    /// shared prefix intact for caching.
+    pub fn fork(&self) -> Self {
+        Self {
+            messages: self.messages.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+
+    /// Persist this conversation to a JSON file on disk.
+    ///
+    /// The file is overwritten if it already exists (idempotent for the same
+    /// process — one conversation per process directory).
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .context("failed to serialize conversation")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create dir: {}", parent.display()))?;
+        }
+        fs::write(path, &json)
+            .with_context(|| format!("failed to write conversation to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Load a conversation from a JSON file on disk.
+    ///
+    /// Returns `Ok(None)` if the file does not exist (not an error — the
+    /// caller should fall back to a fresh conversation).  Returns an error
+    /// if the file exists but cannot be parsed, or if the model / base URL
+    /// have changed since the conversation was saved (to avoid sending
+    /// messages to a different provider).
+    pub fn load_from_file(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = fs::read_to_string(path)
+            .with_context(|| format!("failed to read conversation from {}", path.display()))?;
+        let conv: Self = serde_json::from_str(&json)
+            .with_context(|| format!("failed to parse conversation from {}", path.display()))?;
+
+        // Compatibility check: reject if model or base URL changed.
+        let current_model = model();
+        let current_base = base_url();
+        if conv.model != current_model || conv.base_url != current_base {
+            log::warn!(
+                "conversation file {} was created with model={} base_url={}; \
+                 current model={} base_url={} — starting fresh conversation",
+                path.display(),
+                conv.model,
+                conv.base_url,
+                current_model,
+                current_base,
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(conv))
+    }
+
+    /// Manually append an assistant message to the conversation history.
+    ///
+    /// Use this when content is produced externally (e.g. a merge step or a
+    /// multi-section path) and needs to be available as context for subsequent
+    /// turns.
+    pub fn add_assistant(&mut self, content: &str) {
+        self.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: content.to_string(),
+        });
+    }
+
+    /// Send a user message and return the assistant's text response.
+    ///
+    /// Appends the user message, sends the complete conversation history via
+    /// [`chat_completion`], appends the assistant response, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LLM call fails.  The conversation state is
+    /// **not** modified on failure (the user message is not persisted).
+    pub async fn turn(
+        &mut self,
+        user_message: &str,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<String> {
+        // Append user message tentatively — we'll remove it on failure.
+        self.messages.push(ChatMessage {
+            role: "user".into(),
+            content: user_message.to_string(),
+        });
+
+        match chat_completion(&self.messages, temperature, max_tokens, None).await {
+            Ok(response) => {
+                self.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: response.clone(),
+                });
+                Ok(response)
+            }
+            Err(e) => {
+                // Roll back the user message on failure.
+                self.messages.pop();
+                Err(e)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1473,105 @@ mod tests {
 
     /// Global mutex to serialise env-var mutation tests.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // ChatConversation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conversation_new_starts_with_system() {
+        let conv = ChatConversation::new("You are a helpful assistant.");
+        let msgs = conv.messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+        assert!(msgs[0].content.contains("helpful assistant"));
+    }
+
+    #[test]
+    fn test_conversation_fork_is_independent() {
+        let mut conv = ChatConversation::new("System.");
+
+        // Seed the conversation with a fake assistant message.
+        conv.add_assistant("Fake response 1");
+
+        // Fork — should have the same history.
+        let mut fork = conv.fork();
+        assert_eq!(fork.messages().len(), 2);
+        assert_eq!(fork.messages()[1].content, "Fake response 1");
+
+        // Add to fork — original should be unaffected.
+        fork.add_assistant("Fork-only response");
+        assert_eq!(fork.messages().len(), 3);
+        assert_eq!(conv.messages().len(), 2);
+    }
+
+    #[test]
+    fn test_conversation_add_assistant() {
+        let mut conv = ChatConversation::new("System.");
+        assert_eq!(conv.messages().len(), 1);
+
+        conv.add_assistant("Response one.");
+        assert_eq!(conv.messages().len(), 2);
+        assert_eq!(conv.messages()[1].role, "assistant");
+        assert_eq!(conv.messages()[1].content, "Response one.");
+
+        conv.add_assistant("Response two.");
+        assert_eq!(conv.messages().len(), 3);
+    }
+
+    #[test]
+    fn test_conversation_fork_preserves_prefix() {
+        let mut conv = ChatConversation::new("System prompt.");
+        conv.add_assistant("Digest content here.");
+
+        let fork = conv.fork();
+        // Fork must have the exact same prefix for caching.
+        assert_eq!(fork.messages().len(), 2);
+        assert_eq!(fork.messages()[0].content, "System prompt.");
+        assert_eq!(fork.messages()[1].content, "Digest content here.");
+    }
+
+    #[test]
+    fn test_conversation_save_and_load_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("conversation.json");
+
+        let mut conv = ChatConversation::new("Test system.");
+        conv.add_assistant("First response.");
+        conv.add_assistant("Second response.");
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = ChatConversation::load_from_file(&path).unwrap().unwrap();
+        assert_eq!(loaded.messages().len(), 3);
+        assert_eq!(loaded.messages()[0].role, "system");
+        assert_eq!(loaded.messages()[0].content, "Test system.");
+        assert_eq!(loaded.messages()[1].role, "assistant");
+        assert_eq!(loaded.messages()[1].content, "First response.");
+        assert_eq!(loaded.messages()[2].role, "assistant");
+        assert_eq!(loaded.messages()[2].content, "Second response.");
+    }
+
+    #[test]
+    fn test_conversation_save_overwrites() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("conversation.json");
+
+        let conv = ChatConversation::new("A.");
+        conv.save_to_file(&path).unwrap();
+
+        let conv2 = ChatConversation::new("B.");
+        conv2.save_to_file(&path).unwrap();
+
+        let loaded = ChatConversation::load_from_file(&path).unwrap().unwrap();
+        assert_eq!(loaded.messages()[0].content, "B.");
+    }
+
+    #[test]
+    fn test_conversation_load_missing_file_returns_none() {
+        let result = ChatConversation::load_from_file(Path::new("/nonexistent/conversation.json"))
+            .unwrap();
+        assert!(result.is_none());
+    }
 
     #[test]
     fn test_is_available_when_key_not_set() {

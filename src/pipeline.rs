@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::artifacts::SpaceUtilization;
 use crate::canvas_sjtu::CanvasSJTUVideoClient;
 use crate::distill;
 use crate::latex;
@@ -28,6 +29,9 @@ pub struct PipelineResult {
     pub errors: Vec<String>,
     #[serde(default)]
     pub logs: Vec<String>,
+    /// Space utilisation info from `typst query` (populated for render stage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_utilization: Option<SpaceUtilization>,
 }
 
 impl PipelineResult {
@@ -41,6 +45,7 @@ impl PipelineResult {
             artifact_paths,
             errors: Vec::new(),
             logs,
+            space_utilization: None,
         }
     }
 
@@ -50,6 +55,7 @@ impl PipelineResult {
             artifact_paths: Vec::new(),
             errors,
             logs,
+            space_utilization: None,
         }
     }
 
@@ -59,6 +65,7 @@ impl PipelineResult {
             artifact_paths: Vec::new(),
             errors: Vec::new(),
             logs: Vec::new(),
+            space_utilization: None,
         }
     }
 }
@@ -356,8 +363,26 @@ impl PipelineRunner {
                     "Compression attempts: {}",
                     artifact.compression_attempts
                 ));
+                if let Some(ref su) = artifact.space_utilization {
+                    logs.push(format!(
+                        "Space utilisation: total={:.2} pages, last_page={:.1}%{}",
+                        su.total_content_pages,
+                        su.last_page_utilization_pct,
+                        if su.last_page_under_utilized {
+                            " (under-utilised)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
 
-                PipelineResult::succeeded(vec![artifact.pdf_path], logs)
+                PipelineResult {
+                    status: "succeeded".to_string(),
+                    artifact_paths: vec![artifact.pdf_path],
+                    errors: Vec::new(),
+                    logs,
+                    space_utilization: artifact.space_utilization,
+                }
             }
             Ok(Err(e)) => {
                 logs.push(format!("Render failed: {}", e));
@@ -427,6 +452,64 @@ impl PipelineRunner {
         // Stage 4: Render PDF.
         result.render = self.render_pdf("distilled.md", output_pdf, template_path, max_pages);
 
+        // Stage 5 (optional): If the last page is under-utilised, attempt
+        // LLM expansion and re-render (best-effort, max 1 attempt).
+        if result.render.ok() {
+            if let Some(ref su) = result.render.space_utilization {
+                if su.last_page_under_utilized {
+                    let target_pct =
+                        (1.0 - su.last_page_utilization_pct / 100.0).max(0.1) * 100.0;
+                    log::info!(
+                        "under-utilised render detected (last page {:.1}%) — attempting LLM expansion (target +{:.0}%)",
+                        su.last_page_utilization_pct,
+                        target_pct
+                    );
+
+                    match distill::distill_expand(
+                        "distilled.md",
+                        "distilled.expanded.md",
+                        target_pct,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            log::info!("LLM expansion succeeded — re-rendering");
+                            let expanded_render = self.render_pdf(
+                                "distilled.expanded.md",
+                                output_pdf,
+                                template_path,
+                                max_pages,
+                            );
+                            if expanded_render.ok() {
+                                if let Some(ref expanded_su) =
+                                    expanded_render.space_utilization
+                                {
+                                    if !expanded_su.last_page_under_utilized {
+                                        log::info!(
+                                            "expansion resolved under-utilisation"
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "expansion improved but still under-utilised ({:.1}%)",
+                                            expanded_su.last_page_utilization_pct
+                                        );
+                                    }
+                                }
+                                result.render = expanded_render;
+                            } else {
+                                log::warn!(
+                                    "re-render after expansion failed — keeping original"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("LLM expansion failed: {:#} — keeping original", e);
+                        }
+                    }
+                }
+            }
+        }
+
         result
     }
 }
@@ -480,6 +563,7 @@ mod tests {
             artifact_paths: vec!["a.json".to_string(), "b.srt".to_string()],
             errors: vec![],
             logs: vec!["log1".to_string(), "log2".to_string()],
+            space_utilization: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let parsed: PipelineResult = serde_json::from_str(&json).unwrap();

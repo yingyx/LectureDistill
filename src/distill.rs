@@ -183,6 +183,90 @@ pub fn deterministic_distill(content: &str, concepts: &[RankedConcept]) -> Strin
     output
 }
 
+/// Expand an existing distilled cheat sheet to better fill available space.
+///
+/// Called when [`crate::latex::SpaceUtilization`] detects that the last page
+/// is under-utilised (below the underflow threshold).
+///
+/// * `existing_path` — path to the already-distilled Markdown file.
+/// * `output_path` — where to write the expanded version.
+/// * `expansion_target_pct` — approximate target expansion (e.g. `40.0` means
+///   "add ~40% more content").
+///
+/// Returns the expanded content.
+pub async fn distill_expand(
+    existing_path: &str,
+    output_path: &str,
+    expansion_target_pct: f64,
+) -> Result<String> {
+    let content = fs::read_to_string(existing_path)
+        .with_context(|| format!("failed to read existing distilled file: {}", existing_path))?;
+
+    let expanded = if llm::is_available() {
+        match llm_expand(&content, expansion_target_pct).await {
+            Ok(text) => text,
+            Err(e) => {
+                log::warn!(
+                    "LLM expansion failed, keeping original content: {}",
+                    e
+                );
+                content.clone()
+            }
+        }
+    } else {
+        log::info!("LLM not available — skipping expansion, keeping original content");
+        content.clone()
+    };
+
+    fs::write(output_path, &expanded)
+        .with_context(|| format!("failed to write expanded output: {}", output_path))?;
+
+    Ok(expanded)
+}
+
+/// LLM-based content expansion.
+///
+/// Asks the model to add more detail, examples, and explanations while
+/// preserving the existing structure and all key concepts.
+async fn llm_expand(existing: &str, target_pct: f64) -> Result<String> {
+    let target_desc = if target_pct < 15.0 {
+        "slightly".to_string()
+    } else if target_pct < 35.0 {
+        "moderately".to_string()
+    } else {
+        "substantially".to_string()
+    };
+
+    let system_prompt = format!(
+        "You are an exam preparation assistant. A cheat sheet has been \
+         created but it under-utilises the available page space (the last \
+         page is only partially filled). Your task is to {} expand the \
+         content by adding more high-value material: detailed explanations, \
+         concrete examples, key formulas with derivations, mnemonic devices, \
+         and comparative tables where appropriate. \
+         \
+         Important rules: \
+         - Preserve ALL existing headings, structure, and key concepts. \
+         - Do NOT remove or shorten any existing content. \
+         - Add content that is genuinely useful for exam preparation. \
+         - Target approximately {:.0}% more total content. \
+         - Return clean Markdown suitable for the cheat sheet template.",
+        target_desc, target_pct
+    );
+
+    let truncated: String = existing.chars().take(25000).collect();
+    let user_prompt = format!(
+        "Current cheat sheet ({} chars):\n\n{}\n\n\
+         Please expand this cheat sheet. Add more detail, examples, and \
+         explanations where they would be most valuable for exam preparation. \
+         The goal is to better utilise the available page space.",
+        truncated.chars().count(),
+        truncated,
+    );
+
+    llm::chat_text(&system_prompt, &user_prompt, 0.3, 16384).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -187,6 +187,45 @@ fn default_relevance() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Space utilization (Typst query analysis)
+// ---------------------------------------------------------------------------
+
+/// Per-page utilization data from `typst query` analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageUtilizationData {
+    /// Page number (1-based).
+    pub page: usize,
+    /// Content utilization as a percentage (0.0–100.0).
+    pub utilization_pct: f64,
+}
+
+/// Overall space utilisation analysis computed from `typst query`.
+///
+/// Used both for overflow (decide layout-tightening vs content compression)
+/// and underflow (decide whether to trigger LLM expansion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceUtilization {
+    /// Total effective pages of content (sum of per-page utilisation ratios).
+    /// E.g. 2.20 means two full pages plus 20% of a third.
+    pub total_content_pages: f64,
+    /// The target `max_pages` that was requested.
+    pub max_pages: usize,
+    /// Overflow ratio: `total_content_pages / max_pages`.
+    /// `Some(1.10)` when pages > max_pages; `None` when within limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow_ratio: Option<f64>,
+    /// Per-page utilisation data.
+    #[serde(default)]
+    pub page_utilizations: Vec<PageUtilizationData>,
+    /// Whether the last page is significantly under-utilised (below threshold).
+    #[serde(default)]
+    pub last_page_under_utilized: bool,
+    /// Utilisation percentage of the last page (0.0–100.0).
+    #[serde(default)]
+    pub last_page_utilization_pct: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Cheat sheet artifact
 // ---------------------------------------------------------------------------
 
@@ -208,6 +247,9 @@ pub struct CheatSheetArtifact {
     /// Number of compression attempts applied.
     #[serde(default)]
     pub compression_attempts: usize,
+    /// Space utilisation analysis from `typst query` (available when Typst was used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_utilization: Option<SpaceUtilization>,
 }
 
 fn default_template_name() -> String {
@@ -223,6 +265,7 @@ impl CheatSheetArtifact {
             distilled_content_path,
             rendered_at: Utc::now().to_rfc3339(),
             compression_attempts: 0,
+            space_utilization: None,
         }
     }
 }

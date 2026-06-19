@@ -985,6 +985,7 @@ async fn api_canvas_fetch_subtitles(
                         artifact_paths: paths,
                         errors,
                         logs,
+                        space_utilization: None,
                     }
                 }
                 "day" if date.is_some() => {
@@ -4280,17 +4281,6 @@ async fn run_process_outputs(
         .filter(|o| o.kind == ProcessOutputKind::ReferenceDigest)
         .cloned()
         .collect();
-    if !reference_digest_outputs.is_empty() {
-        run_reference_digest_outputs(
-            process_id,
-            source_ids,
-            &reference_digest_outputs,
-            process_store,
-            source_store,
-            job_id,
-        )
-        .await;
-    }
 
     // 3) Cheating Sheet outputs.
     let cheating_sheet_outputs: Vec<ProcessOutput> = outputs
@@ -4298,9 +4288,36 @@ async fn run_process_outputs(
         .filter(|o| o.kind == ProcessOutputKind::CheatingSheet)
         .cloned()
         .collect();
-    if !cheating_sheet_outputs.is_empty() {
-        run_cheating_sheet_outputs(process_id, &cheating_sheet_outputs, process_store, job_id)
+
+    // When both Ref Digest AND Cheat Sheet are requested, use the unified
+    // multi-turn pipeline for DeepSeek prefix caching.
+    if !reference_digest_outputs.is_empty() && !cheating_sheet_outputs.is_empty() {
+        run_unified_cheat_pipeline(
+            process_id,
+            source_ids,
+            &reference_digest_outputs,
+            &cheating_sheet_outputs,
+            process_store,
+            source_store,
+            job_id,
+        )
+        .await;
+    } else {
+        if !reference_digest_outputs.is_empty() {
+            run_reference_digest_outputs(
+                process_id,
+                source_ids,
+                &reference_digest_outputs,
+                process_store,
+                source_store,
+                job_id,
+            )
             .await;
+        }
+        if !cheating_sheet_outputs.is_empty() {
+            run_cheating_sheet_outputs(process_id, &cheating_sheet_outputs, process_store, job_id)
+                .await;
+        }
     }
 }
 
@@ -4918,6 +4935,117 @@ fn build_ref_digest_user_prompt(
     ));
 
     user
+}
+
+// ---------------------------------------------------------------------------
+// Unified multi-turn pipeline — system prompt
+// ---------------------------------------------------------------------------
+
+/// Build a single system prompt that covers all three pipeline stages.
+///
+/// A single system prompt is required for DeepSeek prefix caching: the system
+/// message is always the first element of the messages array, so it must be
+/// identical across turns for the prefix to match.
+fn build_unified_pipeline_system_prompt(max_pages: usize) -> String {
+    format!(
+        "You are an exam preparation assistant.  In this conversation you will \
+         perform up to three stages in sequence:\n\n\
+         STAGE 1 — Reference Digest: Create a detailed, structured Markdown \
+         Reference Digest from lecture transcripts.  Cover definitions, formulas, \
+         conditions, algorithms, steps, comparisons, pitfalls, exam judgement \
+         rules, and timestamp evidence.  Be comprehensive and precise — the \
+         digest will be compressed into an exam cheat sheet downstream.  Use \
+         ## for top-level sections and ### for subsections.  Include [MM:SS] \
+         timestamps when referencing specific moments.  Do not invent facts \
+         beyond the supplied sources.\n\n\
+         STAGE 2 — Cheat Sheet: Convert the Reference Digest into a compact \
+         {}–page exam cheat-sheet Markdown for a fixed LaTeX template.  Cover \
+         every topic comprehensively: for each section, include essential \
+         definitions, formulas, conditions, algorithm steps, comparisons, \
+         pitfalls, and exam judgement rules.  It is better to include slightly \
+         too much content than too little — the renderer will compress if \
+         needed.  Do not omit topics.\n\n\
+         STAGE 3 — Expansion (only if asked): Expand the cheat sheet by adding \
+         high-value material from the Reference Digest that is missing.  \
+         Preserve the existing structure, headings, and content exactly as-is. \
+         Only add new material where it fits naturally.  Do not fabricate facts, \
+         do not rewrite existing sections, and do not change the document \
+         structure.\n\n\
+         ---\n\
+         Language: Chinese for Chinese source material; keep standard English \
+         technical terms, identifiers, symbols, and formulas.\n\n\
+         Output rules: Return ONLY Markdown for the requested stage, with no \
+         code fences and no explanations.  Do not use raw LaTeX commands except \
+         ordinary math delimited by $...$ or $$...$$.  The Markdown will be \
+         inserted into a XeLaTeX/xeCJK four-column A4 template, so avoid syntax \
+         that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, \
+         nested tables, Mermaid, TikZ, custom macros, \\begin blocks, or \
+         unbalanced braces.  Use only #, ##, ### headings, -, 1. lists, inline \
+         code for identifiers, bold for key terms, and standard Markdown math.  \
+         Every formula must be syntactically balanced.  Keep underscores and \
+         percent signs inside math or code when possible.",
+        max_pages
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Unified multi-turn pipeline — per-turn user prompts
+// ---------------------------------------------------------------------------
+
+/// Build the Turn 2 user prompt: compress the Reference Digest into a cheat sheet.
+///
+/// The Reference Digest is NOT repeated here — it is already in the
+/// conversation as the Turn 1 assistant response.
+fn build_cheat_sheet_turn2_prompt(
+    inventory: &str,
+    section_names: &str,
+    section_count: usize,
+    max_pages: usize,
+    budget: &CheatingSheetBudget,
+) -> String {
+    format!(
+        "STAGE 2 — CHEAT SHEET.\n\n\
+         Target: a {} page(s) exam cheat sheet.\n\
+         Roughly {} characters typically fills {} page(s); up to {} is fine — \
+         the renderer will compress if needed.\n\n\
+         Coverage requirement: the Reference Digest has {} main sections in order: {}\n\
+         Every main section MUST contribute at least one of: definition, formula, \
+         condition, algorithm step, pitfall, comparison, or exam judgement rule.\n\n\
+         Section inventory:\n{}\n\n\
+         Do not invent new facts.  Extract and organize the essential content from \
+         the Reference Digest you created above.  Prefer completeness over conciseness.\n\n\
+         Return only the complete cheating-sheet Markdown.  Aim for roughly {} \
+         characters; more is acceptable.",
+        max_pages,
+        budget.target_chars,
+        max_pages,
+        budget.soft_max_chars,
+        section_count,
+        section_names,
+        inventory,
+        budget.target_chars,
+    )
+}
+
+/// Build the Turn 3 user prompt: expand the cheat sheet with missing content.
+///
+/// Both the Reference Digest and the Cheat Sheet are already in the
+/// conversation history — no excerpt or repetition needed.
+fn build_expansion_turn3_prompt(target_add_chars: usize, inventory: &str) -> String {
+    format!(
+        "STAGE 3 — EXPANSION.\n\n\
+         The cheat sheet you just created should be expanded with missing \
+         high-value content from the Reference Digest you created earlier.  \
+         Add approximately {} more characters of high-value material.  \
+         Maintain the exact same heading hierarchy and document structure.\n\n\
+         Section inventory (all sections must remain covered):\n{}\n\n\
+         Add the most exam-critical missing material: definitions, formulas, \
+         conditions, pitfalls, algorithm steps, comparisons, and judgement \
+         rules.  Do NOT add narrative, examples without reusable patterns, \
+         or anything already covered.\n\n\
+         Return the complete expanded cheat-sheet Markdown.",
+        target_add_chars, inventory
+    )
 }
 
 /// Course-based Reference Digest generation using staged outline -> section -> merge pipeline.
@@ -6655,19 +6783,29 @@ struct CheatingSheetGenerationResult {
 
 /// Decide whether to attempt an expansion pass.
 ///
-/// Expansion is warranted only when the rendered page count is below max_pages
-/// AND the source is long enough to support meaningful additions.
-/// We prefer compression of over-generated content to expansion of under-generated content.
+/// Expansion is warranted when:
+/// - The source is long enough to support meaningful additions, AND
+/// - Either the page count is below max_pages (traditional check), OR
+/// - The last page is under-utilised (precise check from `typst query`).
+///
+/// We prefer compression of over-generated content to expansion of
+/// under-generated content.
 fn should_attempt_expansion(
     _generated_chars: usize,
     _min_acceptable_chars: usize,
     page_count: usize,
     max_pages: usize,
     source_too_short: bool,
+    space_utilization: Option<&crate::artifacts::SpaceUtilization>,
 ) -> bool {
     if source_too_short {
         return false;
     }
+    // Use precise utilisation data when available.
+    if let Some(su) = space_utilization {
+        return su.last_page_under_utilized;
+    }
+    // Fall back to simple page-count heuristic.
     page_count < max_pages
 }
 
@@ -6805,6 +6943,30 @@ async fn run_cheating_sheet_outputs(
         }
     };
 
+    // Attempt to load a saved multi-turn conversation from a prior unified
+    // pipeline run.  If present, we can continue the conversation instead of
+    // starting a fresh LLM call — this preserves the Reference Digest in
+    // context and enables DeepSeek prefix-cache hits.
+    let conv_path = process_store.process_dir(process_id).join("conversation.json");
+    let saved_conversation = match crate::llm::ChatConversation::load_from_file(&conv_path) {
+        Ok(Some(conv)) => {
+            web_log(format!(
+                "job {} cheating-sheet: loaded saved conversation ({} messages)",
+                job_id,
+                conv.messages().len(),
+            ));
+            Some(conv)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            web_log(format!(
+                "job {} cheating-sheet: failed to load conversation, starting fresh: {}",
+                job_id, e,
+            ));
+            None
+        }
+    };
+
     for output in outputs {
         update_single_output_progress(
             process_store,
@@ -6832,52 +6994,89 @@ async fn run_cheating_sheet_outputs(
             budget.min_acceptable_chars, ref_digest_chars, source_too_short,
         ));
 
-        let gen_result = match generate_cheating_sheet_markdown(&ref_digest_markdown, max_pages)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                web_log(format!(
-                    "job {} cheating-sheet: LLM condensation failed, rendering compressed Reference Digest directly: {}",
-                    job_id, e
-                ));
-                let fallback_md = latex::compress_content(&ref_digest_markdown, 1);
-                let fallback_chars = fallback_md.chars().count();
-                // Fallback with no expansion — cannot expand a non-LLM draft.
-                let markdown_path =
-                    cheating_sheet_markdown_path(process_store, process_id, &output.id);
-                if let Some(parent) = markdown_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if let Err(write_err) = fs::write(&markdown_path, &fallback_md) {
-                    let _ = process_store.update(process_id, |r| {
-                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
-                            o.status = ProcessRecordStatus::Failed;
-                            o.last_error = Some(format!(
-                                "Failed to write Cheating Sheet Markdown: {}",
-                                write_err
-                            ));
-                            o.updated_at = ProcessRecord::now_iso();
-                        }
-                    });
+        // Saved fork with Turn 2 exchange, for use in Turn 3 (Expansion).
+        let mut saved_turn2_fork: Option<crate::llm::ChatConversation> = None;
+
+        let gen_result = {
+            let llm_result = if let Some(ref conv) = saved_conversation {
+                // Continue the saved conversation (Turn 2).
+                let (sections, inventory) = build_section_inventory(&ref_digest_markdown);
+                let section_count = sections.len();
+                let section_names: String = sections
+                    .iter()
+                    .map(|s| s.heading.clone())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let turn2_user = build_cheat_sheet_turn2_prompt(
+                    &inventory,
+                    &section_names,
+                    section_count,
+                    max_pages,
+                    &budget,
+                );
+                let mut fork = conv.fork();
+                let result = fork.turn(&turn2_user, 0.2, 81920).await.map(|text| {
+                    let md = strip_markdown_fences(&text);
+                    let chars = md.chars().count();
+                    CheatingSheetGenerationResult {
+                        markdown: md,
+                        target_chars: budget.target_chars,
+                        generated_chars: chars,
+                        harness_attempts: 1,
+                        expansion_used: false,
+                        underfilled_reason: None,
+                    }
+                });
+                // Save fork for potential Turn 3 (Expansion).
+                saved_turn2_fork = Some(fork);
+                result
+            } else {
+                generate_cheating_sheet_markdown(&ref_digest_markdown, max_pages).await
+            };
+
+            match llm_result {
+                Ok(result) => result,
+                Err(e) => {
+                    web_log(format!(
+                        "job {} cheating-sheet: LLM condensation failed, rendering compressed Reference Digest directly: {}",
+                        job_id, e
+                    ));
+                    let fallback_md = latex::compress_content(&ref_digest_markdown, 1);
+                    let fallback_chars = fallback_md.chars().count();
+                    let markdown_path =
+                        cheating_sheet_markdown_path(process_store, process_id, &output.id);
+                    if let Some(parent) = markdown_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Err(write_err) = fs::write(&markdown_path, &fallback_md) {
+                        let _ = process_store.update(process_id, |r| {
+                            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                                o.status = ProcessRecordStatus::Failed;
+                                o.last_error = Some(format!(
+                                    "Failed to write Cheating Sheet Markdown: {}",
+                                    write_err
+                                ));
+                                o.updated_at = ProcessRecord::now_iso();
+                            }
+                        });
+                        continue;
+                    }
+                    finish_cheating_sheet_render(
+                        process_store,
+                        process_id,
+                        output,
+                        ref_digest,
+                        &fallback_md,
+                        &markdown_path,
+                        max_pages,
+                        budget.target_chars,
+                        fallback_chars,
+                        0,
+                        false,
+                        Some("llm_failed".to_string()),
+                    );
                     continue;
                 }
-                // Render fallback without expansion.
-                finish_cheating_sheet_render(
-                    process_store,
-                    process_id,
-                    output,
-                    ref_digest,
-                    &fallback_md,
-                    &markdown_path,
-                    max_pages,
-                    budget.target_chars,
-                    fallback_chars,
-                    0,
-                    false,
-                    Some("llm_failed".to_string()),
-                );
-                continue;
             }
         };
 
@@ -6926,11 +7125,18 @@ async fn run_cheating_sheet_outputs(
                     artifact.page_count,
                     max_pages,
                     source_too_short,
+                    artifact.space_utilization.as_ref(),
                 );
                 web_log(format!(
-                    "job {} cheating-sheet: first render page_count={} max_pages={} generated_chars={} source_too_short={} -> expand={}",
+                    "job {} cheating-sheet: first render page_count={} max_pages={} generated_chars={} source_too_short={} space_util={:?} -> expand={}",
                     job_id, artifact.page_count, max_pages, gen_result.generated_chars,
-                    source_too_short, decision,
+                    source_too_short,
+                    artifact.space_utilization.as_ref().map(|su| format!(
+                        "last_page={:.1}% under={}",
+                        su.last_page_utilization_pct,
+                        su.last_page_under_utilized
+                    )),
+                    decision,
                 ));
                 decision
             }
@@ -6963,17 +7169,26 @@ async fn run_cheating_sheet_outputs(
                 job_id, current_chars, budget.target_chars, target_add_chars,
             ));
             let (_sections, inventory) = build_section_inventory(&ref_digest_markdown);
-            let ref_digest_excerpt =
-                truncate_ref_digest_for_cheatsheet(&ref_digest_markdown, 90000).0;
 
-            let (exp_system, exp_user) = build_expansion_prompt(
-                &gen_result.markdown,
-                &inventory,
-                &ref_digest_excerpt,
-                target_add_chars,
-            );
+            let expanded_result = if let Some(ref mut fork) = saved_turn2_fork {
+                // Continue the conversation with Turn 3 (full Ref Digest and
+                // Cheat Sheet already in context — no excerpt needed).
+                let turn3_user = build_expansion_turn3_prompt(target_add_chars, &inventory);
+                fork.turn(&turn3_user, 0.2, 81920).await
+            } else {
+                // Old standalone expansion path.
+                let ref_digest_excerpt =
+                    truncate_ref_digest_for_cheatsheet(&ref_digest_markdown, 90000).0;
+                let (exp_system, exp_user) = build_expansion_prompt(
+                    &gen_result.markdown,
+                    &inventory,
+                    &ref_digest_excerpt,
+                    target_add_chars,
+                );
+                crate::llm::chat_text(&exp_system, &exp_user, 0.2, 81920).await
+            };
 
-            match crate::llm::chat_text(&exp_system, &exp_user, 0.2, 81920).await {
+            match expanded_result {
                 Ok(expanded_text) => {
                     let expanded_md = strip_markdown_fences(&expanded_text);
                     let expanded_chars = expanded_md.chars().count();
@@ -7111,6 +7326,1197 @@ async fn run_cheating_sheet_outputs(
                             "",
                             &markdown_path.to_string_lossy().to_string(),
                             &ref_digest.id,
+                            final_result.target_chars,
+                            final_result.generated_chars,
+                            final_result.harness_attempts,
+                            final_result.expansion_used,
+                            0,
+                            final_result.underfilled_reason.as_deref(),
+                        );
+                        o.updated_at = ProcessRecord::now_iso();
+                    }
+                });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified multi-turn pipeline (Ref Digest → Cheat Sheet → Expansion)
+// ---------------------------------------------------------------------------
+
+/// Dispatcher: route to single-pass or multi-section unified pipeline.
+///
+/// Called from [`run_process_outputs`] when both Reference Digest and
+/// Cheat Sheet outputs are requested in the same process.  Uses
+/// [`ChatConversation`] for multi-turn LLM calls so that DeepSeek's prefix
+/// caching reuses KV states across stages.
+async fn run_unified_cheat_pipeline(
+    process_id: &str,
+    source_ids: &[String],
+    ref_digest_outputs: &[ProcessOutput],
+    cheat_sheet_outputs: &[ProcessOutput],
+    process_store: &ProcessStore,
+    source_store: &SourceStore,
+    job_id: &str,
+) {
+    let sources = source_store.load_all();
+
+    // Separate note and transcript sources (mirrors run_reference_digest_outputs).
+    let note_source: Option<&SourceRecord> = sources
+        .iter()
+        .find(|s| source_ids.contains(&s.id) && s.kind == SourceKind::Note);
+    let transcript_sources: Vec<&SourceRecord> = sources
+        .iter()
+        .filter(|s| source_ids.contains(&s.id) && s.kind == SourceKind::TranscriptDay)
+        .collect();
+    let course_sources: Vec<&SourceRecord> = sources
+        .iter()
+        .filter(|s| source_ids.contains(&s.id) && s.kind == SourceKind::TranscriptCourse)
+        .collect();
+
+    if transcript_sources.is_empty() && course_sources.is_empty() {
+        let err_msg = "No valid transcript sources found.".to_string();
+        for output in ref_digest_outputs
+            .iter()
+            .chain(cheat_sheet_outputs.iter())
+        {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.clone());
+                }
+            });
+        }
+        return;
+    }
+
+    // Check LLM availability.
+    if !crate::llm::is_available() {
+        let err_msg =
+            "LLM is not available. Set OPENAI_API_KEY in Settings.".to_string();
+        for output in ref_digest_outputs
+            .iter()
+            .chain(cheat_sheet_outputs.iter())
+        {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.clone());
+                }
+            });
+        }
+        return;
+    }
+
+    // Course-based path: still runs the existing separate pipeline (deferred).
+    if !course_sources.is_empty() {
+        web_log(format!(
+            "job {} unified-pipeline: course sources present — falling back to separate pipeline",
+            job_id,
+        ));
+        run_reference_digest_outputs(
+            process_id,
+            source_ids,
+            ref_digest_outputs,
+            process_store,
+            source_store,
+            job_id,
+        )
+        .await;
+        run_cheating_sheet_outputs(process_id, cheat_sheet_outputs, process_store, job_id).await;
+        return;
+    }
+
+    // Read note content for style/structure reference.
+    let note_content: Option<String> = match note_source {
+        Some(note) => match fs::read_to_string(&note.path) {
+            Ok(c) => Some(truncate_for_llm(&c, 50000)),
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline: failed to read note source {}: {}",
+                    job_id, note.path, e,
+                ));
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Build combined transcript context.
+    let context_limit: usize = 100000;
+    let mut combined_context = String::new();
+    for src in &transcript_sources {
+        if combined_context.chars().count() >= context_limit {
+            break;
+        }
+        match fs::read_to_string(&src.path) {
+            Ok(content) => {
+                let compact = crate::llm::compact_transcript_for_llm(
+                    &content,
+                    context_limit.saturating_sub(combined_context.chars().count()),
+                );
+                combined_context.push_str(&format!(
+                    "\n\n--- Source: {} (type: {}) ---\n",
+                    src.title,
+                    src.kind.to_string()
+                ));
+                combined_context.push_str(&compact);
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline: failed to read source {}: {}",
+                    job_id, src.path, e
+                ));
+            }
+        }
+    }
+
+    let combined_chars = combined_context.chars().count();
+    let fits_in_one_call =
+        combined_chars <= 100000 && transcript_sources.len() <= 2;
+
+    // Determine max_pages from the first cheat_sheet_output (for the system prompt).
+    let max_pages = cheat_sheet_outputs
+        .first()
+        .and_then(|o| o.metadata.get("max_pages"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(2)
+        .clamp(1, 20);
+
+    let source_counts = serde_json::json!({
+        "note": note_source.is_some(),
+        "transcript_day": transcript_sources.len(),
+        "transcript_course": course_sources.len(),
+    });
+
+    if fits_in_one_call {
+        run_cheat_pipeline_single_pass(
+            process_id,
+            note_content,
+            &combined_context,
+            max_pages,
+            source_counts,
+            transcript_sources.len(),
+            ref_digest_outputs,
+            cheat_sheet_outputs,
+            process_store,
+            job_id,
+        )
+        .await;
+    } else {
+        run_cheat_pipeline_multi_section(
+            process_id,
+            note_content,
+            &transcript_sources,
+            max_pages,
+            source_counts,
+            ref_digest_outputs,
+            cheat_sheet_outputs,
+            process_store,
+            job_id,
+        )
+        .await;
+    }
+}
+
+/// Single-pass unified pipeline: Ref Digest generation → Cheat Sheet → Expansion.
+async fn run_cheat_pipeline_single_pass(
+    process_id: &str,
+    note_content: Option<String>,
+    transcript_context: &str,
+    max_pages: usize,
+    source_counts: serde_json::Value,
+    _transcript_count: usize,
+    ref_digest_outputs: &[ProcessOutput],
+    cheat_sheet_outputs: &[ProcessOutput],
+    process_store: &ProcessStore,
+    job_id: &str,
+) {
+    // --- Stage 1: Reference Digest (Turn 1) ---
+
+    // Update progress for ref_digest outputs.
+    for output in ref_digest_outputs {
+        let _ = process_store.update(process_id, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                o.metadata = serde_json::json!({
+                    "progress_current": 1,
+                    "progress_total": 2,
+                    "progress_label": "generating digest (unified)",
+                });
+            }
+        });
+    }
+
+    let system_prompt = build_unified_pipeline_system_prompt(max_pages);
+    let turn1_user = build_ref_digest_user_prompt(&note_content, transcript_context, None);
+
+    let mut conversation = crate::llm::ChatConversation::new(&system_prompt);
+
+    let digest_markdown = match conversation.turn(&turn1_user, 0.25, 81920).await {
+        Ok(text) => strip_markdown_fences(&text),
+        Err(e) => {
+            let err_msg = format!("Reference Digest generation failed: {}", e);
+            for output in ref_digest_outputs
+                .iter()
+                .chain(cheat_sheet_outputs.iter())
+            {
+                let _ = process_store.update(process_id, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                        o.status = ProcessRecordStatus::Failed;
+                        o.last_error = Some(err_msg.clone());
+                    }
+                });
+            }
+            return;
+        }
+    };
+
+    // Write digest to disk and mark Ready for each ref_digest output.
+    let generated_chars = digest_markdown.chars().count();
+    for output in ref_digest_outputs {
+        let output_path = process_store.output_path(process_id, &output.id);
+        if let Some(parent) = output_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&output_path, &digest_markdown) {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Failed to write output: {}", e));
+                }
+            });
+            continue;
+        }
+        let _ = process_store.update(process_id, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                o.status = ProcessRecordStatus::Ready;
+                o.last_error = None;
+                o.metadata = serde_json::json!({
+                    "progress_current": 2,
+                    "progress_total": 2,
+                    "progress_label": "complete",
+                    "source_note_used": note_content.is_some(),
+                    "source_counts": source_counts,
+                    "generated_chars": generated_chars,
+                });
+                o.updated_at = ProcessRecord::now_iso();
+            }
+        });
+    }
+
+    // Persist conversation for downstream retries (Cheat Sheet, Expansion).
+    let conv_path = process_store.process_dir(process_id).join("conversation.json");
+    if let Err(e) = conversation.save_to_file(&conv_path) {
+        web_log(format!(
+            "job {} unified-pipeline: failed to save conversation: {}",
+            job_id, e,
+        ));
+    }
+
+    // Build section inventory once for all cheat sheet outputs.
+    let (sections, inventory) = build_section_inventory(&digest_markdown);
+    let section_count = sections.len();
+    let section_names = sections
+        .iter()
+        .map(|s| s.heading.clone())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    // --- Stage 2 & 3: Cheat Sheet + optional Expansion (per output) ---
+
+    for output in cheat_sheet_outputs {
+        let output_max_pages = output
+            .metadata
+            .get("max_pages")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(max_pages)
+            .clamp(1, 20);
+
+        let ref_digest_chars = digest_markdown.chars().count();
+        let budget = estimate_cheating_sheet_budget(output_max_pages);
+        let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
+
+        web_log(format!(
+            "job {} unified-pipeline: output {} budget max_pages={} target={} soft_max={} ref_digest_chars={} source_too_short={}",
+            job_id, output.id, output_max_pages, budget.target_chars, budget.soft_max_chars,
+            ref_digest_chars, source_too_short,
+        ));
+
+        // Fork conversation for this output.
+        let mut fork = conversation.fork();
+
+        update_single_output_progress(
+            process_store,
+            process_id,
+            &output.id,
+            1,
+            4,
+            "condensing markdown (unified)",
+        );
+
+        // Turn 2: Cheat Sheet compression.
+        let turn2_user = build_cheat_sheet_turn2_prompt(
+            &inventory,
+            &section_names,
+            section_count,
+            output_max_pages,
+            &budget,
+        );
+
+        let gen_result = match fork.turn(&turn2_user, 0.2, 81920).await {
+            Ok(text) => {
+                let md = strip_markdown_fences(&text);
+                let chars = md.chars().count();
+                CheatingSheetGenerationResult {
+                    markdown: md,
+                    target_chars: budget.target_chars,
+                    generated_chars: chars,
+                    harness_attempts: 1,
+                    expansion_used: false,
+                    underfilled_reason: None,
+                }
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline: Turn 2 LLM failed for output {}, falling back to compress_content: {}",
+                    job_id, output.id, e,
+                ));
+                let fallback_md = latex::compress_content(&digest_markdown, 1);
+                let fallback_chars = fallback_md.chars().count();
+                let markdown_path =
+                    cheating_sheet_markdown_path(process_store, process_id, &output.id);
+                if let Some(parent) = markdown_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Err(write_err) = fs::write(&markdown_path, &fallback_md) {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(format!(
+                                "Failed to write Cheating Sheet Markdown: {}",
+                                write_err
+                            ));
+                            o.updated_at = ProcessRecord::now_iso();
+                        }
+                    });
+                    continue;
+                }
+                finish_cheating_sheet_render(
+                    process_store,
+                    process_id,
+                    output,
+                    ref_digest_outputs.first().unwrap_or(output),
+                    &fallback_md,
+                    &markdown_path,
+                    output_max_pages,
+                    budget.target_chars,
+                    fallback_chars,
+                    0,
+                    false,
+                    Some("llm_failed".to_string()),
+                );
+                continue;
+            }
+        };
+
+        // Write markdown to disk.
+        let markdown_path = cheating_sheet_markdown_path(process_store, process_id, &output.id);
+        if let Some(parent) = markdown_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&markdown_path, &gen_result.markdown) {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Failed to write Cheating Sheet Markdown: {}", e));
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+            continue;
+        }
+
+        // Render.
+        update_single_output_progress(
+            process_store,
+            process_id,
+            &output.id,
+            2,
+            4,
+            "rendering LaTeX",
+        );
+        let pdf_path = process_output_path_for(
+            process_store,
+            process_id,
+            &output.id,
+            &ProcessOutputKind::CheatingSheet,
+        );
+        let render_result = latex::render_cheatsheet(
+            &markdown_path.to_string_lossy(),
+            None,
+            &pdf_path.to_string_lossy(),
+            output_max_pages,
+        );
+
+        // Expansion decision.
+        let should_expand = match &render_result {
+            Ok(artifact) => {
+                let decision = should_attempt_expansion(
+                    gen_result.generated_chars,
+                    budget.min_acceptable_chars,
+                    artifact.page_count,
+                    output_max_pages,
+                    source_too_short,
+                    artifact.space_utilization.as_ref(),
+                );
+                web_log(format!(
+                    "job {} unified-pipeline: first render page_count={} max_pages={} generated_chars={} source_too_short={} space_util={:?} -> expand={}",
+                    job_id, artifact.page_count, output_max_pages, gen_result.generated_chars,
+                    source_too_short,
+                    artifact.space_utilization.as_ref().map(|su| format!(
+                        "last_page={:.1}% under={}",
+                        su.last_page_utilization_pct,
+                        su.last_page_under_utilized
+                    )),
+                    decision,
+                ));
+                decision
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline: first render FAILED: {} — skipping expansion",
+                    job_id, e,
+                ));
+                false
+            }
+        };
+
+        let (final_result, expansion_used, final_page_count) = if should_expand {
+            update_single_output_progress(
+                process_store,
+                process_id,
+                &output.id,
+                3,
+                4,
+                "expanding content (unified)",
+            );
+
+            let current_chars = gen_result.generated_chars;
+            let target_add_chars = (budget.target_chars.saturating_sub(current_chars))
+                .min(6000)
+                .max(2000);
+
+            web_log(format!(
+                "job {} unified-pipeline: expansion triggered — current_chars={} target_chars={} target_add_chars={}",
+                job_id, current_chars, budget.target_chars, target_add_chars,
+            ));
+
+            // Build Turn 3 prompt — no truncated excerpt needed (full Ref Digest
+            // and Cheat Sheet are already in conversation history).
+            let turn3_user = build_expansion_turn3_prompt(target_add_chars, &inventory);
+
+            match fork.turn(&turn3_user, 0.2, 81920).await {
+                Ok(expanded_text) => {
+                    let expanded_md = strip_markdown_fences(&expanded_text);
+                    let expanded_chars = expanded_md.chars().count();
+
+                    if let Err(e) = fs::write(&markdown_path, &expanded_md) {
+                        web_log(format!(
+                            "job {} unified-pipeline: failed to write expansion markdown: {}",
+                            job_id, e
+                        ));
+                        (
+                            gen_result,
+                            false,
+                            render_result.as_ref().ok().map(|a| a.page_count),
+                        )
+                    } else {
+                        let exp_render = latex::render_cheatsheet(
+                            &markdown_path.to_string_lossy(),
+                            None,
+                            &pdf_path.to_string_lossy(),
+                            output_max_pages,
+                        );
+                        match exp_render {
+                            Ok(exp_artifact) => {
+                                let mut result = gen_result.clone();
+                                result.markdown = expanded_md;
+                                result.generated_chars = expanded_chars;
+                                result.harness_attempts = 2;
+                                result.expansion_used = true;
+                                (result, true, Some(exp_artifact.page_count))
+                            }
+                            Err(e) => {
+                                web_log(format!(
+                                    "job {} unified-pipeline: expansion render failed, keeping first draft: {}",
+                                    job_id, e
+                                ));
+                                let _ = fs::write(&markdown_path, &gen_result.markdown);
+                                (
+                                    gen_result,
+                                    false,
+                                    render_result.as_ref().ok().map(|a| a.page_count),
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    web_log(format!(
+                        "job {} unified-pipeline: expansion LLM call failed, keeping first draft: {}",
+                        job_id, e
+                    ));
+                    (
+                        gen_result,
+                        false,
+                        render_result.as_ref().ok().map(|a| a.page_count),
+                    )
+                }
+            }
+        } else {
+            let page_count = render_result.as_ref().ok().map(|a| a.page_count);
+            let underfilled_reason = if source_too_short {
+                Some("source_too_short".to_string())
+            } else {
+                None
+            };
+            if let Some(ref reason) = underfilled_reason {
+                web_log(format!(
+                    "job {} unified-pipeline: expansion skipped — reason={} ref_digest_chars={} min_acceptable={}",
+                    job_id, reason, ref_digest_chars, budget.min_acceptable_chars,
+                ));
+            }
+            let mut result = gen_result;
+            result.underfilled_reason = underfilled_reason;
+            (result, false, page_count)
+        };
+
+        // Final render.
+        let final_render_result = if expansion_used {
+            latex::render_cheatsheet(
+                &markdown_path.to_string_lossy(),
+                None,
+                &pdf_path.to_string_lossy(),
+                output_max_pages,
+            )
+        } else {
+            render_result
+        };
+
+        // Find the reference digest output for linking.
+        let ref_digest_id = ref_digest_outputs
+            .first()
+            .map(|o| o.id.clone())
+            .unwrap_or_default();
+
+        match final_render_result {
+            Ok(artifact) => {
+                let _ = process_store.update(process_id, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                        o.status = ProcessRecordStatus::Ready;
+                        o.path = artifact.pdf_path.clone();
+                        o.diff_path = None;
+                        o.base_source_id = Some(ref_digest_id.clone());
+                        o.last_error = None;
+                        o.metadata = build_cheatsheet_metadata(
+                            4,
+                            4,
+                            "complete",
+                            output_max_pages,
+                            artifact.page_count,
+                            artifact.compression_attempts,
+                            &artifact.template_used,
+                            &markdown_path.to_string_lossy().to_string(),
+                            &ref_digest_id,
+                            final_result.target_chars,
+                            final_result.generated_chars,
+                            final_result.harness_attempts,
+                            final_result.expansion_used,
+                            final_page_count.unwrap_or(artifact.page_count),
+                            final_result.underfilled_reason.as_deref(),
+                        );
+                        o.updated_at = ProcessRecord::now_iso();
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = process_store.update(process_id, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                        o.status = ProcessRecordStatus::Failed;
+                        o.last_error = Some(format!("Cheating Sheet render failed: {}", e));
+                        o.metadata = build_cheatsheet_metadata(
+                            3,
+                            4,
+                            "render failed",
+                            output_max_pages,
+                            0,
+                            0,
+                            "",
+                            &markdown_path.to_string_lossy().to_string(),
+                            &ref_digest_id,
+                            final_result.target_chars,
+                            final_result.generated_chars,
+                            final_result.harness_attempts,
+                            final_result.expansion_used,
+                            0,
+                            final_result.underfilled_reason.as_deref(),
+                        );
+                        o.updated_at = ProcessRecord::now_iso();
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Multi-section unified pipeline: per-source section digests → merge → Cheat Sheet → Expansion.
+async fn run_cheat_pipeline_multi_section(
+    process_id: &str,
+    note_content: Option<String>,
+    transcript_sources: &[&SourceRecord],
+    max_pages: usize,
+    source_counts: serde_json::Value,
+    ref_digest_outputs: &[ProcessOutput],
+    cheat_sheet_outputs: &[ProcessOutput],
+    process_store: &ProcessStore,
+    job_id: &str,
+) {
+    // --- Phase 1: Generate per-source section digests (unchanged from existing) ---
+
+    for output in ref_digest_outputs {
+        let _ = process_store.update(process_id, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                o.metadata = serde_json::json!({
+                    "progress_current": 1,
+                    "progress_total": 2,
+                    "progress_label": "generating section digests",
+                });
+            }
+        });
+    }
+
+    let mut section_digests: Vec<String> = Vec::new();
+    for src in transcript_sources {
+        let src_content = match fs::read_to_string(&src.path) {
+            Ok(c) => c,
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline: failed to read source {}: {}",
+                    job_id, src.path, e
+                ));
+                continue;
+            }
+        };
+        let compact = crate::llm::compact_transcript_for_llm(&src_content, 90000);
+        let src_context = format!(
+            "Source: {} (type: {})\n{}",
+            src.title,
+            src.kind.to_string(),
+            compact
+        );
+        match generate_ref_digest_section(&note_content, &src_context).await {
+            Ok(md) => section_digests.push(md),
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline: section digest for {} failed: {}",
+                    job_id, src.title, e
+                ));
+            }
+        }
+    }
+
+    if section_digests.is_empty() {
+        let err_msg = "All section digest generations failed.".to_string();
+        for output in ref_digest_outputs
+            .iter()
+            .chain(cheat_sheet_outputs.iter())
+        {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.clone());
+                }
+            });
+        }
+        return;
+    }
+
+    // Build the merge prompt content.
+    let combined_sections = section_digests
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("<!-- digest section {} -->\n{}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let truncated_combined: String = combined_sections.chars().take(160000).collect();
+
+    // --- Phase 2: Merge → Cheat Sheet → Expansion (multi-turn conversation) ---
+
+    let system_prompt = build_unified_pipeline_system_prompt(max_pages);
+    let turn1_user = format!(
+        "STAGE 1 — REFERENCE DIGEST (MERGE).\n\n\
+         Merge and normalize these Reference Digest sections into one complete \
+         Markdown document:\n\n{}\n\n\
+         Return only Markdown.",
+        truncated_combined
+    );
+    // Add note as assistant context if present (for style reference).
+    let note_context = note_content.as_deref().map(|n| {
+        format!(
+            "Reference Note (style/structure reference):\n\n{}\n\n---",
+            n
+        )
+    });
+
+    let mut conversation = crate::llm::ChatConversation::new(&system_prompt);
+    if let Some(ref nc) = note_context {
+        // Inject note context before the merge instruction.
+        let turn1_with_note = format!("{}\n\n{}", nc, turn1_user);
+        let user_msg = turn1_with_note;
+        // We build a single combined user message.
+        let digest_markdown = match conversation.turn(&user_msg, 0.2, 81920).await {
+            Ok(text) => strip_markdown_fences(&text),
+            Err(e) => {
+                let err_msg = format!("Reference Digest merge failed: {}", e);
+                for output in ref_digest_outputs
+                    .iter()
+                    .chain(cheat_sheet_outputs.iter())
+                {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(err_msg.clone());
+                        }
+                    });
+                }
+                return;
+            }
+        };
+        // --- Write digest, build inventory, process cheat sheet outputs ---
+        write_digest_and_process_cheat_sheets(
+            process_id,
+            &digest_markdown,
+            note_content.is_some(),
+            &source_counts,
+            ref_digest_outputs,
+            cheat_sheet_outputs,
+            max_pages,
+            &conversation,
+            process_store,
+            job_id,
+        )
+        .await;
+    } else {
+        let digest_markdown = match conversation.turn(&turn1_user, 0.2, 81920).await {
+            Ok(text) => strip_markdown_fences(&text),
+            Err(e) => {
+                let err_msg = format!("Reference Digest merge failed: {}", e);
+                for output in ref_digest_outputs
+                    .iter()
+                    .chain(cheat_sheet_outputs.iter())
+                {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(err_msg.clone());
+                        }
+                    });
+                }
+                return;
+            }
+        };
+        write_digest_and_process_cheat_sheets(
+            process_id,
+            &digest_markdown,
+            note_content.is_some(),
+            &source_counts,
+            ref_digest_outputs,
+            cheat_sheet_outputs,
+            max_pages,
+            &conversation,
+            process_store,
+            job_id,
+        )
+        .await;
+    }
+}
+
+/// Helper: write digest to disk and process all cheat sheet outputs.
+///
+/// Shared between single-pass and multi-section paths to avoid code duplication.
+async fn write_digest_and_process_cheat_sheets(
+    process_id: &str,
+    digest_markdown: &str,
+    _note_used: bool,
+    source_counts: &serde_json::Value,
+    ref_digest_outputs: &[ProcessOutput],
+    cheat_sheet_outputs: &[ProcessOutput],
+    max_pages: usize,
+    conversation: &crate::llm::ChatConversation,
+    process_store: &ProcessStore,
+    job_id: &str,
+) {
+    let generated_chars = digest_markdown.chars().count();
+
+    // Write digest to disk for each ref_digest output.
+    for output in ref_digest_outputs {
+        let output_path = process_store.output_path(process_id, &output.id);
+        if let Some(parent) = output_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&output_path, digest_markdown) {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Failed to write output: {}", e));
+                }
+            });
+            continue;
+        }
+        let _ = process_store.update(process_id, |r| {
+            if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                o.status = ProcessRecordStatus::Ready;
+                o.last_error = None;
+                o.metadata = serde_json::json!({
+                    "progress_current": 2,
+                    "progress_total": 2,
+                    "progress_label": "complete",
+                    "source_note_used": _note_used,
+                    "source_counts": source_counts,
+                    "generated_chars": generated_chars,
+                });
+                o.updated_at = ProcessRecord::now_iso();
+            }
+        });
+    }
+
+    // Persist conversation for downstream retries.
+    let conv_path = process_store.process_dir(process_id).join("conversation.json");
+    if let Err(e) = conversation.save_to_file(&conv_path) {
+        web_log(format!(
+            "job {} unified-pipeline: failed to save conversation: {}",
+            job_id, e,
+        ));
+    }
+
+    // Build section inventory once.
+    let (sections, inventory) = build_section_inventory(digest_markdown);
+    let section_count = sections.len();
+    let section_names = sections
+        .iter()
+        .map(|s| s.heading.clone())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let ref_digest_chars = digest_markdown.chars().count();
+    let ref_digest_id = ref_digest_outputs
+        .first()
+        .map(|o| o.id.clone())
+        .unwrap_or_default();
+
+    // Process each cheat sheet output.
+    for output in cheat_sheet_outputs {
+        let output_max_pages = output
+            .metadata
+            .get("max_pages")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(max_pages)
+            .clamp(1, 20);
+
+        let budget = estimate_cheating_sheet_budget(output_max_pages);
+        let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
+
+        web_log(format!(
+            "job {} unified-pipeline (multi): output {} budget max_pages={} target={} soft_max={} ref_digest_chars={} source_too_short={}",
+            job_id, output.id, output_max_pages, budget.target_chars, budget.soft_max_chars,
+            ref_digest_chars, source_too_short,
+        ));
+
+        let mut fork = conversation.fork();
+
+        update_single_output_progress(
+            process_store,
+            process_id,
+            &output.id,
+            1,
+            4,
+            "condensing markdown (unified)",
+        );
+
+        // Turn 2: Cheat Sheet compression.
+        let turn2_user = build_cheat_sheet_turn2_prompt(
+            &inventory,
+            &section_names,
+            section_count,
+            output_max_pages,
+            &budget,
+        );
+
+        let gen_result = match fork.turn(&turn2_user, 0.2, 81920).await {
+            Ok(text) => {
+                let md = strip_markdown_fences(&text);
+                let chars = md.chars().count();
+                CheatingSheetGenerationResult {
+                    markdown: md,
+                    target_chars: budget.target_chars,
+                    generated_chars: chars,
+                    harness_attempts: 1,
+                    expansion_used: false,
+                    underfilled_reason: None,
+                }
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline (multi): Turn 2 LLM failed for output {}, falling back: {}",
+                    job_id, output.id, e,
+                ));
+                let fallback_md = latex::compress_content(digest_markdown, 1);
+                let fallback_chars = fallback_md.chars().count();
+                let markdown_path =
+                    cheating_sheet_markdown_path(process_store, process_id, &output.id);
+                if let Some(parent) = markdown_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Err(write_err) = fs::write(&markdown_path, &fallback_md) {
+                    let _ = process_store.update(process_id, |r| {
+                        if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                            o.status = ProcessRecordStatus::Failed;
+                            o.last_error = Some(format!(
+                                "Failed to write Cheating Sheet Markdown: {}",
+                                write_err
+                            ));
+                            o.updated_at = ProcessRecord::now_iso();
+                        }
+                    });
+                    continue;
+                }
+                finish_cheating_sheet_render(
+                    process_store,
+                    process_id,
+                    output,
+                    ref_digest_outputs.first().unwrap_or(output),
+                    &fallback_md,
+                    &markdown_path,
+                    output_max_pages,
+                    budget.target_chars,
+                    fallback_chars,
+                    0,
+                    false,
+                    Some("llm_failed".to_string()),
+                );
+                continue;
+            }
+        };
+
+        // Write markdown to disk.
+        let markdown_path = cheating_sheet_markdown_path(process_store, process_id, &output.id);
+        if let Some(parent) = markdown_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&markdown_path, &gen_result.markdown) {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(format!("Failed to write Cheating Sheet Markdown: {}", e));
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+            continue;
+        }
+
+        // Render.
+        update_single_output_progress(
+            process_store,
+            process_id,
+            &output.id,
+            2,
+            4,
+            "rendering LaTeX",
+        );
+        let pdf_path = process_output_path_for(
+            process_store,
+            process_id,
+            &output.id,
+            &ProcessOutputKind::CheatingSheet,
+        );
+        let render_result = latex::render_cheatsheet(
+            &markdown_path.to_string_lossy(),
+            None,
+            &pdf_path.to_string_lossy(),
+            output_max_pages,
+        );
+
+        // Expansion decision.
+        let should_expand = match &render_result {
+            Ok(artifact) => {
+                let decision = should_attempt_expansion(
+                    gen_result.generated_chars,
+                    budget.min_acceptable_chars,
+                    artifact.page_count,
+                    output_max_pages,
+                    source_too_short,
+                    artifact.space_utilization.as_ref(),
+                );
+                web_log(format!(
+                    "job {} unified-pipeline (multi): first render page_count={} -> expand={}",
+                    job_id, artifact.page_count, decision,
+                ));
+                decision
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} unified-pipeline (multi): first render FAILED: {} — skipping expansion",
+                    job_id, e,
+                ));
+                false
+            }
+        };
+
+        let (final_result, expansion_used, final_page_count) = if should_expand {
+            update_single_output_progress(
+                process_store,
+                process_id,
+                &output.id,
+                3,
+                4,
+                "expanding content (unified)",
+            );
+            let current_chars = gen_result.generated_chars;
+            let target_add_chars = (budget.target_chars.saturating_sub(current_chars))
+                .min(6000)
+                .max(2000);
+
+            let turn3_user = build_expansion_turn3_prompt(target_add_chars, &inventory);
+
+            match fork.turn(&turn3_user, 0.2, 81920).await {
+                Ok(expanded_text) => {
+                    let expanded_md = strip_markdown_fences(&expanded_text);
+                    let expanded_chars = expanded_md.chars().count();
+                    if let Err(e) = fs::write(&markdown_path, &expanded_md) {
+                        web_log(format!(
+                            "job {} unified-pipeline (multi): failed to write expansion: {}",
+                            job_id, e
+                        ));
+                        (
+                            gen_result,
+                            false,
+                            render_result.as_ref().ok().map(|a| a.page_count),
+                        )
+                    } else {
+                        let exp_render = latex::render_cheatsheet(
+                            &markdown_path.to_string_lossy(),
+                            None,
+                            &pdf_path.to_string_lossy(),
+                            output_max_pages,
+                        );
+                        match exp_render {
+                            Ok(exp_artifact) => {
+                                let mut result = gen_result.clone();
+                                result.markdown = expanded_md;
+                                result.generated_chars = expanded_chars;
+                                result.harness_attempts = 2;
+                                result.expansion_used = true;
+                                (result, true, Some(exp_artifact.page_count))
+                            }
+                            Err(e) => {
+                                web_log(format!(
+                                    "job {} unified-pipeline (multi): expansion render failed: {}",
+                                    job_id, e
+                                ));
+                                let _ = fs::write(&markdown_path, &gen_result.markdown);
+                                (
+                                    gen_result,
+                                    false,
+                                    render_result.as_ref().ok().map(|a| a.page_count),
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    web_log(format!(
+                        "job {} unified-pipeline (multi): expansion LLM failed: {}",
+                        job_id, e
+                    ));
+                    (
+                        gen_result,
+                        false,
+                        render_result.as_ref().ok().map(|a| a.page_count),
+                    )
+                }
+            }
+        } else {
+            let page_count = render_result.as_ref().ok().map(|a| a.page_count);
+            let underfilled_reason = if source_too_short {
+                Some("source_too_short".to_string())
+            } else {
+                None
+            };
+            let mut result = gen_result;
+            result.underfilled_reason = underfilled_reason;
+            (result, false, page_count)
+        };
+
+        // Final render.
+        let final_render_result = if expansion_used {
+            latex::render_cheatsheet(
+                &markdown_path.to_string_lossy(),
+                None,
+                &pdf_path.to_string_lossy(),
+                output_max_pages,
+            )
+        } else {
+            render_result
+        };
+
+        match final_render_result {
+            Ok(artifact) => {
+                let _ = process_store.update(process_id, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                        o.status = ProcessRecordStatus::Ready;
+                        o.path = artifact.pdf_path.clone();
+                        o.diff_path = None;
+                        o.base_source_id = Some(ref_digest_id.clone());
+                        o.last_error = None;
+                        o.metadata = build_cheatsheet_metadata(
+                            4,
+                            4,
+                            "complete",
+                            output_max_pages,
+                            artifact.page_count,
+                            artifact.compression_attempts,
+                            &artifact.template_used,
+                            &markdown_path.to_string_lossy().to_string(),
+                            &ref_digest_id,
+                            final_result.target_chars,
+                            final_result.generated_chars,
+                            final_result.harness_attempts,
+                            final_result.expansion_used,
+                            final_page_count.unwrap_or(artifact.page_count),
+                            final_result.underfilled_reason.as_deref(),
+                        );
+                        o.updated_at = ProcessRecord::now_iso();
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = process_store.update(process_id, |r| {
+                    if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                        o.status = ProcessRecordStatus::Failed;
+                        o.last_error = Some(format!("Cheating Sheet render failed: {}", e));
+                        o.metadata = build_cheatsheet_metadata(
+                            3,
+                            4,
+                            "render failed",
+                            output_max_pages,
+                            0,
+                            0,
+                            "",
+                            &markdown_path.to_string_lossy().to_string(),
+                            &ref_digest_id,
                             final_result.target_chars,
                             final_result.generated_chars,
                             final_result.harness_attempts,
@@ -9499,15 +10905,15 @@ Section B body is shorter.
     #[test]
     fn test_underfilled_triggers_expansion_when_pages_below_max() {
         // 12000 generated, min is 8250 (above), but only 1 page of 2.
-        let result = should_attempt_expansion(12000, 8250, 1, 2, false);
+        let result = should_attempt_expansion(12000, 8250, 1, 2, false, None);
         assert!(result, "should expand when page count < max pages");
     }
 
     #[test]
     fn test_no_expansion_when_char_count_low_but_pages_full() {
         // 3000 generated (well below min 8250), but page count already at max.
-        // Expansion should NOT trigger — page count is the sole criterion.
-        let result = should_attempt_expansion(3000, 8250, 2, 2, false);
+        // Expansion should NOT trigger — page count is full, no utilisation data.
+        let result = should_attempt_expansion(3000, 8250, 2, 2, false, None);
         assert!(
             !result,
             "should NOT expand when pages are full, even if char count is low"
@@ -9517,14 +10923,14 @@ Section B body is shorter.
     #[test]
     fn test_no_expansion_when_source_too_short() {
         // 5000 generated, page count 1 of 2, but source is too short.
-        let result = should_attempt_expansion(5000, 8250, 1, 2, true);
+        let result = should_attempt_expansion(5000, 8250, 1, 2, true, None);
         assert!(!result, "should NOT expand when source is too short");
     }
 
     #[test]
     fn test_no_expansion_when_filled() {
         // 20000 generated, min is 8250, 2 pages of 2, source is long.
-        let result = should_attempt_expansion(20000, 8250, 2, 2, false);
+        let result = should_attempt_expansion(20000, 8250, 2, 2, false, None);
         assert!(!result, "should NOT expand when already filled");
     }
 
