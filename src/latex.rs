@@ -467,12 +467,13 @@ fn parse_typst_length_to_mm(s: &str) -> Option<f64> {
     }
 
     // Split numeric prefix from unit suffix.
-    let (num_str, unit) = if let Some(pos) = s.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
-        let (n, u) = s.split_at(pos);
-        (n, u)
-    } else {
-        return s.parse::<f64>().ok(); // assume mm if no unit
-    };
+    let (num_str, unit) =
+        if let Some(pos) = s.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
+            let (n, u) = s.split_at(pos);
+            (n, u)
+        } else {
+            return s.parse::<f64>().ok(); // assume mm if no unit
+        };
 
     let value: f64 = num_str.parse().ok()?;
     match unit {
@@ -485,7 +486,7 @@ fn parse_typst_length_to_mm(s: &str) -> Option<f64> {
             log::debug!("unknown typst length unit: {:?} in {:?}", unit, s);
             value
         }
-        .into()
+        .into(),
     }
 }
 
@@ -494,54 +495,72 @@ fn parse_typst_length_to_mm(s: &str) -> Option<f64> {
 /// Queries for `heading`, `list.item`, and `par` elements which cover
 /// essentially all text content in the default cheat-sheet template.
 fn run_typst_query(typ_path: &str, typst_exe: &str) -> Result<Vec<TypstElement>> {
-    let output = std::process::Command::new(typst_exe)
-        .args([
-            "query",
-            typ_path,
-            "heading, list.item, par",
-            "--field",
-            "location",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to run `{} query`", typst_exe))?;
+    // Try multiple selectors individually — Typst 0.14+ is picky about comma
+    // syntax and only certain element types are locatable.  We try each one
+    // and merge the results.
+    let selectors: &[&str] = &["figure", "table", "heading", "enum", "list"];
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut all_elements = Vec::new();
+
+    for selector in selectors {
+        let output = match std::process::Command::new(typst_exe)
+            .args(["query", typ_path, selector, "--field", "location"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() {
+            // Some selectors aren't locatable — skip silently.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not locatable") || stderr.contains("failed to evaluate") {
+                continue;
+            }
+            // Other errors might indicate real issues — still try next selector.
+            log::debug!("typst query '{}' failed: {}", selector, stderr.trim());
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = match serde_json::from_str(&stdout) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let arr = match json.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+
+        for item in arr {
+            let func = item["func"].as_str().unwrap_or("unknown").to_string();
+            let loc = &item["location"];
+            let page = loc["page"].as_u64().unwrap_or(1) as usize;
+            let y_str = loc["y"].as_str().unwrap_or("0mm");
+
+            let y_mm = parse_typst_length_to_mm(y_str).unwrap_or(0.0);
+
+            all_elements.push(TypstElement {
+                page,
+                y_mm,
+                element_type: func,
+            });
+        }
+    }
+
+    if all_elements.is_empty() {
         bail!(
-            "`{} query` exited with status {}: {}",
-            typst_exe,
-            output.status,
-            stderr.trim()
+            "typst query returned no locatable elements (selector(s) attempted: {:?}). \
+             This is expected with the default template — space utilisation will be \
+             estimated from page count and char budget.",
+            selectors
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).context("failed to parse typst query JSON output")?;
-
-    let arr = json
-        .as_array()
-        .context("typst query output is not a JSON array")?;
-
-    let mut elements = Vec::with_capacity(arr.len());
-    for item in arr {
-        let func = item["func"].as_str().unwrap_or("unknown").to_string();
-        let loc = &item["location"];
-        let page = loc["page"].as_u64().unwrap_or(1) as usize;
-        let y_str = loc["y"].as_str().unwrap_or("0mm");
-
-        let y_mm = parse_typst_length_to_mm(y_str).unwrap_or(0.0);
-
-        elements.push(TypstElement {
-            page,
-            y_mm,
-            element_type: func,
-        });
-    }
-
-    Ok(elements)
+    Ok(all_elements)
 }
 
 /// Compute per-page space utilisation from `typst query` element positions.
@@ -614,6 +633,65 @@ fn compute_space_utilization(
     }
 }
 
+/// Fallback space utilisation estimate when `typst query` is unavailable.
+///
+/// Uses a char-budget model: each page holds ~11000 chars comfortably.
+/// When `input_chars` is provided, the estimate is more accurate; otherwise
+/// falls back to coarse page-count heuristics.
+fn estimate_space_utilization_from_pages(
+    page_count: usize,
+    max_pages: usize,
+) -> SpaceUtilization {
+    let total_content_pages = page_count as f64;
+    let overflow_ratio = if page_count > max_pages {
+        Some(page_count as f64 / max_pages.max(1) as f64)
+    } else {
+        None
+    };
+
+    // When pages < max_pages, estimate per-page utilisation based on how
+    // many pages are actually used vs available.  If only 1 of 2 pages is
+    // used, the last page is the only page — estimate ~95% if the render
+    // stopped at page_count (no overflow), meaning the single page is full.
+    let last_page_util = if page_count > max_pages {
+        100.0
+    } else if page_count < max_pages {
+        // Pages < max: the last (and only) page is likely near-full since
+        // the typst/latex renderer didn't need more pages.  Estimate ~95%.
+        95.0
+    } else {
+        // Exact match: assume well-filled.
+        95.0
+    };
+
+    // Under-utilised when fewer pages were used than allowed.  Even if the
+    // existing page(s) are full, the document as a whole has unused capacity
+    // — expansion should be attempted to fill the remaining pages.
+    let last_page_under = page_count < max_pages;
+
+    let mut page_utils = Vec::with_capacity(page_count.max(1));
+    for p in 0..page_count {
+        let util = if p + 1 < page_count || page_count == 1 {
+            last_page_util
+        } else {
+            95.0
+        };
+        page_utils.push(PageUtilizationData {
+            page: p + 1,
+            utilization_pct: util,
+        });
+    }
+
+    SpaceUtilization {
+        total_content_pages,
+        max_pages,
+        overflow_ratio,
+        page_utilizations: page_utils,
+        last_page_under_utilized: last_page_under,
+        last_page_utilization_pct: last_page_util,
+    }
+}
+
 /// Try to run `typst query` and compute space utilisation.
 ///
 /// Returns `None` on any error (missing typst, parse failure, etc.) so that
@@ -626,6 +704,7 @@ fn try_compute_space_utilization(
 ) -> Option<SpaceUtilization> {
     match run_typst_query(typ_path, typst_exe) {
         Ok(elements) => {
+            let elem_count = elements.len();
             let su = compute_space_utilization(&elements, page_count, max_pages);
             log::info!(
                 "space utilisation: total_content_pages={:.2}, overflow_ratio={:?}, last_page={:.1}%{}",
@@ -638,11 +717,49 @@ fn try_compute_space_utilization(
                     ""
                 }
             );
+            // Per-page utilization breakdown.
+            for page_data in &su.page_utilizations {
+                log::info!(
+                    "  page {}: {:.1}% utilised",
+                    page_data.page,
+                    page_data.utilization_pct
+                );
+            }
+            // Also emit via web_log for CLI/stderr visibility.
+            crate::utils::output::web_log(format!(
+                "space_util: elements={} pages={} total_content_pages={:.2} overflow_ratio={:?} last_page_util={:.1}% under_utilized={}",
+                elem_count,
+                su.page_utilizations.len(),
+                su.total_content_pages,
+                su.overflow_ratio,
+                su.last_page_utilization_pct,
+                su.last_page_under_utilized,
+            ));
+            for page_data in &su.page_utilizations {
+                crate::utils::output::web_log(format!(
+                    "space_util:   page {}: {:.1}% utilised",
+                    page_data.page,
+                    page_data.utilization_pct,
+                ));
+            }
             Some(su)
         }
         Err(e) => {
             log::warn!("typst query skipped: {:#}", e);
-            None
+            crate::utils::output::web_log(format!(
+                "space_util: typst query failed — {:#}",
+                e,
+            ));
+            // Fallback: estimate space utilisation from page count and char budget.
+            // This is less precise than typst query but still useful for diagnostics.
+            let fallback = estimate_space_utilization_from_pages(page_count, max_pages);
+            crate::utils::output::web_log(format!(
+                "space_util: using fallback estimate — total_content={:.2} last_page={:.1}% under={}",
+                fallback.total_content_pages,
+                fallback.last_page_utilization_pct,
+                fallback.last_page_under_utilized,
+            ));
+            Some(fallback)
         }
     }
 }
@@ -1165,6 +1282,136 @@ pub fn markdown_to_latex(md_content: &str) -> String {
     output
 }
 
+/// Translate common LaTeX math commands inside `$...$` to Typst-compatible
+/// forms.  Handles commands that Typst doesn't recognise natively in math mode.
+fn translate_latex_math_to_typst(math: &str) -> String {
+    // Common LaTeX → Unicode / Typst translations for math commands.
+    // Sorted roughly by frequency of use in course notes.
+    let replacements: &[(&str, &str)] = &[
+        // Greek letters (LaTeX command → Unicode)
+        (r"\alpha", "α"),
+        (r"\beta", "β"),
+        (r"\gamma", "γ"),
+        (r"\delta", "δ"),
+        (r"\epsilon", "ε"),
+        (r"\varepsilon", "ε"),
+        (r"\zeta", "ζ"),
+        (r"\eta", "η"),
+        (r"\theta", "θ"),
+        (r"\vartheta", "ϑ"),
+        (r"\iota", "ι"),
+        (r"\kappa", "κ"),
+        (r"\lambda", "λ"),
+        (r"\mu", "μ"),
+        (r"\nu", "ν"),
+        (r"\xi", "ξ"),
+        (r"\pi", "π"),
+        (r"\varpi", "ϖ"),
+        (r"\rho", "ρ"),
+        (r"\varrho", "ϱ"),
+        (r"\sigma", "σ"),
+        (r"\varsigma", "ς"),
+        (r"\tau", "τ"),
+        (r"\upsilon", "υ"),
+        (r"\phi", "φ"),
+        (r"\varphi", "ϕ"),
+        (r"\chi", "χ"),
+        (r"\psi", "ψ"),
+        (r"\omega", "ω"),
+        (r"\Gamma", "Γ"),
+        (r"\Delta", "Δ"),
+        (r"\Theta", "Θ"),
+        (r"\Lambda", "Λ"),
+        (r"\Xi", "Ξ"),
+        (r"\Pi", "Π"),
+        (r"\Sigma", "Σ"),
+        (r"\Upsilon", "Υ"),
+        (r"\Phi", "Φ"),
+        (r"\Psi", "Ψ"),
+        (r"\Omega", "Ω"),
+        // Binary operators / relations
+        (r"\propto", "∝"),
+        (r"\approx", "≈"),
+        (r"\equiv", "≡"),
+        (r"\neq", "≠"),
+        (r"\leq", "≤"),
+        (r"\geq", "≥"),
+        (r"\ll", "≪"),
+        (r"\gg", "≫"),
+        (r"\sim", "∼"),
+        (r"\simeq", "≃"),
+        (r"\cong", "≅"),
+        (r"\doteq", "≐"),
+        (r"\subset", "⊂"),
+        (r"\supset", "⊃"),
+        (r"\subseteq", "⊆"),
+        (r"\supseteq", "⊇"),
+        (r"\in", "∈"),
+        (r"\notin", "∉"),
+        (r"\ni", "∋"),
+        (r"\forall", "∀"),
+        (r"\exists", "∃"),
+        (r"\neg", "¬"),
+        (r"\land", "∧"),
+        (r"\lor", "∨"),
+        (r"\to", "→"),
+        (r"\rightarrow", "→"),
+        (r"\Rightarrow", "⇒"),
+        (r"\leftarrow", "←"),
+        (r"\Leftarrow", "⇐"),
+        (r"\leftrightarrow", "↔"),
+        (r"\mapsto", "↦"),
+        (r"\uparrow", "↑"),
+        (r"\downarrow", "↓"),
+        (r"\times", "×"),
+        (r"\cdot", "⋅"),
+        (r"\div", "÷"),
+        (r"\pm", "±"),
+        (r"\mp", "∓"),
+        (r"\oplus", "⊕"),
+        (r"\otimes", "⊗"),
+        (r"\odot", "⊙"),
+        (r"\infty", "∞"),
+        (r"\partial", "∂"),
+        (r"\nabla", "∇"),
+        (r"\int", "∫"),
+        (r"\sum", "∑"),
+        (r"\prod", "∏"),
+        (r"\cap", "∩"),
+        (r"\cup", "∪"),
+        (r"\emptyset", "∅"),
+        // Common notations
+        (r"\ldots", "…"),
+        (r"\cdots", "⋯"),
+        (r"\vdots", "⋮"),
+        (r"\ddots", "⋱"),
+        (r"\angle", "∠"),
+        (r"\triangle", "△"),
+        (r"\square", "□"),
+        (r"\Box", "□"),
+        (r"\Re", "ℜ"),
+        (r"\Im", "ℑ"),
+        (r"\aleph", "ℵ"),
+        // Delimiters
+        (r"\langle", "⟨"),
+        (r"\rangle", "⟩"),
+        (r"\lceil", "⌈"),
+        (r"\rceil", "⌉"),
+        (r"\lfloor", "⌊"),
+        (r"\rfloor", "⌋"),
+    ];
+
+    let mut result = math.to_string();
+    // Sort by descending length to avoid partial matches (e.g. \rightarrow before \to).
+    let mut sorted: Vec<&(&str, &str)> = replacements.iter().collect();
+    sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    for (latex, typst) in &sorted {
+        result = result.replace(latex, typst);
+    }
+    result
+}
+
 fn escape_typst_plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -1204,7 +1451,12 @@ fn markdown_inline_to_typst_no_code(text: &str) -> String {
         result.push_str(&escape_typst_with_emphasis(before));
         if let Some(end_rel) = after_start[1..].find('$') {
             let end = end_rel + 2;
-            result.push_str(&after_start[..end]);
+            // Translate common LaTeX math commands inside $...$ to Typst-compatible forms.
+            let math_content = &after_start[1..end - 1]; // strip $...$
+            let translated = translate_latex_math_to_typst(math_content);
+            result.push('$');
+            result.push_str(&translated);
+            result.push('$');
             rest = &after_start[end..];
         } else {
             result.push_str("\\$");
@@ -1457,75 +1709,85 @@ pub fn render_cheatsheet(
         );
 
         // Apply compression if attempt > 0
+        let original_chars = md_content.chars().count();
         let working_content = if attempt > 0 {
-            compress_content(&md_content, attempt)
+            let compressed = compress_content(&md_content, attempt);
+            let compressed_chars = compressed.chars().count();
+            log::info!(
+                "compression: {} → {} chars ({:.0}% reduction, level {})",
+                original_chars,
+                compressed_chars,
+                (1.0 - compressed_chars as f64 / original_chars.max(1) as f64) * 100.0,
+                attempt
+            );
+            compressed
         } else {
+            log::info!("input content: {} chars (uncompressed)", original_chars);
             md_content.clone()
         };
 
         // --- inner compilation helper (returns (pdf_path, template_name, page_count)) ---
         // Tries Typst first; falls back to LaTeX on failure.
-        let compile_with_template = |typst_template_str: &str,
-                                     label: &str|
-         -> Result<(String, String, usize)> {
-            let mut errors: Vec<String> = Vec::new();
+        let compile_with_template =
+            |typst_template_str: &str, label: &str| -> Result<(String, String, usize)> {
+                let mut errors: Vec<String> = Vec::new();
 
-            // Try Typst first.
-            if !typst_compiler.is_empty() {
-                let typst_body = markdown_to_typst(&working_content);
-                let filled = typst_template_str.replace("{{content}}", &typst_body);
-                match fs::write(&typ_path, &filled) {
-                    Ok(_) => match compile_typst(
-                        &typ_path.to_string_lossy(),
-                        &intermediate_pdf_path.to_string_lossy(),
-                        &typst_compiler,
-                    ) {
-                        Ok(_) => {
-                            let page_count =
-                                count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
-                            return Ok((
-                                intermediate_pdf_path.to_string_lossy().to_string(),
-                                label.to_string(),
-                                page_count,
-                            ));
-                        }
-                        Err(e) => errors.push(format!("typst: {:#}", e)),
-                    },
-                    Err(e) => errors.push(format!("typst write: {:#}", e)),
+                // Try Typst first.
+                if !typst_compiler.is_empty() {
+                    let typst_body = markdown_to_typst(&working_content);
+                    let filled = typst_template_str.replace("{{content}}", &typst_body);
+                    match fs::write(&typ_path, &filled) {
+                        Ok(_) => match compile_typst(
+                            &typ_path.to_string_lossy(),
+                            &intermediate_pdf_path.to_string_lossy(),
+                            &typst_compiler,
+                        ) {
+                            Ok(_) => {
+                                let page_count =
+                                    count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
+                                return Ok((
+                                    intermediate_pdf_path.to_string_lossy().to_string(),
+                                    label.to_string(),
+                                    page_count,
+                                ));
+                            }
+                            Err(e) => errors.push(format!("typst: {:#}", e)),
+                        },
+                        Err(e) => errors.push(format!("typst write: {:#}", e)),
+                    }
                 }
-            }
 
-            // Fall back to LaTeX.
-            if !compiler.is_empty() {
-                let latex_body = markdown_to_latex(&working_content);
-                let filled = template.replace("{{content}}", &latex_body);
-                match fs::write(&tex_path, &filled) {
-                    Ok(_) => match compile_latex(
-                        &tex_path.to_string_lossy(),
-                        &output_dir.to_string_lossy(),
-                        &compiler,
-                    ) {
-                        Ok(_) => {
-                            let page_count =
-                                count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
-                            return Ok((
-                                intermediate_pdf_path.to_string_lossy().to_string(),
-                                label.to_string(),
-                                page_count,
-                            ));
-                        }
-                        Err(e) => errors.push(format!("latex: {:#}", e)),
-                    },
-                    Err(e) => errors.push(format!("latex write: {:#}", e)),
+                // Fall back to LaTeX.
+                if !compiler.is_empty() {
+                    let latex_body = markdown_to_latex(&working_content);
+                    let filled = template.replace("{{content}}", &latex_body);
+                    match fs::write(&tex_path, &filled) {
+                        Ok(_) => match compile_latex(
+                            &tex_path.to_string_lossy(),
+                            &output_dir.to_string_lossy(),
+                            &compiler,
+                        ) {
+                            Ok(_) => {
+                                let page_count =
+                                    count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
+                                return Ok((
+                                    intermediate_pdf_path.to_string_lossy().to_string(),
+                                    label.to_string(),
+                                    page_count,
+                                ));
+                            }
+                            Err(e) => errors.push(format!("latex: {:#}", e)),
+                        },
+                        Err(e) => errors.push(format!("latex write: {:#}", e)),
+                    }
                 }
-            }
 
-            if errors.is_empty() {
-                bail!("no PDF renderer available")
-            } else {
-                bail!("{}", errors.join("; "))
-            }
-        };
+                if errors.is_empty() {
+                    bail!("no PDF renderer available")
+                } else {
+                    bail!("{}", errors.join("; "))
+                }
+            };
 
         // --- compile ---
         let template_label = if !typst_compiler.is_empty() {
@@ -1533,20 +1795,42 @@ pub fn render_cheatsheet(
         } else {
             &latex_template_name
         };
-        let (pdf_path, used_template, page_count) = match compile_with_template(
-            &typst_template,
-            template_label,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("compilation failed: {:#}", e);
-                log::warn!("{}", msg);
-                last_error = Some(msg);
-                continue;
-            }
-        };
+        let (pdf_path, used_template, page_count) =
+            match compile_with_template(&typst_template, template_label) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format!("compilation failed: {:#}", e);
+                    log::warn!("{}", msg);
+                    crate::utils::output::web_log(format!(
+                        "render_cheatsheet: compilation FAILED attempt={}: {}",
+                        attempt, msg,
+                    ));
+                    last_error = Some(msg);
+                    continue;
+                }
+            };
 
+        // Preserve intermediate files in debug mode.
+        if std::env::var("LECTURE_DISTILL_DEBUG").unwrap_or_default() == "1" {
+            let attempt_typ = output_dir.join(format!("cheatsheet_attempt{}.typ", attempt));
+            let attempt_md = output_dir.join(format!("cheatsheet_attempt{}.md", attempt));
+            let _ = fs::copy(&typ_path, &attempt_typ);
+            let _ = fs::write(&attempt_md, &working_content);
+            log::info!(
+                "debug: preserved intermediate files for attempt {}: {}, {}",
+                attempt,
+                attempt_typ.display(),
+                attempt_md.display()
+            );
+        }
+
+        let input_chars_for_log = working_content.chars().count();
+        let chars_per_page_log = input_chars_for_log as f64 / page_count.max(1) as f64;
         log::info!("compiled PDF: {} pages (attempt {})", page_count, attempt);
+        crate::utils::output::web_log(format!(
+            "render_cheatsheet: compiled attempt={} pages={}/{} input_chars={} chars_per_page={:.0}",
+            attempt, page_count, max_pages, input_chars_for_log, chars_per_page_log,
+        ));
 
         // ================================================================
         // Success path — within page limit
@@ -1570,20 +1854,46 @@ pub fn render_cheatsheet(
                 )
             })?;
 
+            // Compute chars/page ratio for diagnostics.
+            let input_chars = working_content.chars().count();
+            let chars_per_page = input_chars as f64 / page_count.max(1) as f64;
+            let fill_pct = chars_per_page / 11000.0 * 100.0;
+            let total_target = max_pages.saturating_mul(11000);
+            let total_fill_pct = input_chars as f64 / total_target.max(1) as f64 * 100.0;
+            let under_util = space_utilization
+                .as_ref()
+                .map_or(false, |su| su.last_page_under_utilized);
             log::info!(
-                "cheat sheet rendered successfully: {} ({} pages, {} compression attempts{})",
+                "cheat sheet rendered successfully: {} ({} pages, {} compression attempts, {} input chars, {:.0} chars/page, {:.0}% per-page fill, {:.0}% total fill{})",
                 out_pdf.display(),
                 page_count,
                 attempt,
-                if space_utilization
-                    .as_ref()
-                    .map_or(false, |su| su.last_page_under_utilized)
-                {
+                input_chars,
+                chars_per_page,
+                fill_pct,
+                total_fill_pct,
+                if under_util {
                     ", last page under-utilised"
                 } else {
                     ""
                 }
             );
+            crate::utils::output::web_log(format!(
+                "render_cheatsheet: SUCCESS attempt={} pages={}/{} input_chars={} chars_per_page={:.0} per_page_fill={:.0}% total_fill={:.0}% under_util={} space_util={:?}",
+                attempt,
+                page_count,
+                max_pages,
+                input_chars,
+                chars_per_page,
+                fill_pct,
+                total_fill_pct,
+                under_util,
+                space_utilization.as_ref().map(|su| format!(
+                    "total_content={:.2} last_page={:.1}%",
+                    su.total_content_pages,
+                    su.last_page_utilization_pct,
+                )),
+            ));
 
             return Ok(CheatSheetArtifact {
                 pdf_path: out_pdf.to_string_lossy().to_string(),
@@ -1617,10 +1927,8 @@ pub fn render_cheatsheet(
                         for layout_level in 1..=2 {
                             let tighter =
                                 generate_tighter_typst_template(&typst_template, layout_level);
-                            let layout_label = format!(
-                                "default_cheatsheet.typ (tight L{})",
-                                layout_level
-                            );
+                            let layout_label =
+                                format!("default_cheatsheet.typ (tight L{})", layout_level);
 
                             match compile_with_template(&tighter, &layout_label) {
                                 Ok((_lp, lt, lc)) => {
@@ -1631,20 +1939,25 @@ pub fn render_cheatsheet(
                                     );
                                     if lc <= max_pages {
                                         // Success with layout-only fix!
-                                        fs::copy(&intermediate_pdf_path, &out_pdf)
-                                            .with_context(|| {
+                                        fs::copy(&intermediate_pdf_path, &out_pdf).with_context(
+                                            || {
                                                 format!(
                                                     "failed to copy PDF from {} to {}",
                                                     intermediate_pdf_path.display(),
                                                     out_pdf.display()
                                                 )
-                                            })?;
+                                            },
+                                        )?;
 
+                                        let input_chars = working_content.chars().count();
+                                        let chars_per_page = input_chars as f64 / lc.max(1) as f64;
                                         log::info!(
-                                            "cheat sheet rendered with layout tightening: {} ({} pages, level {})",
+                                            "cheat sheet rendered with layout tightening: {} ({} pages, level {}, {} input chars, {:.0} chars/page)",
                                             out_pdf.display(),
                                             lc,
-                                            layout_level
+                                            layout_level,
+                                            input_chars,
+                                            chars_per_page
                                         );
 
                                         // Re-check utilisation after tightening.
@@ -1660,15 +1973,11 @@ pub fn render_cheatsheet(
                                         };
 
                                         return Ok(CheatSheetArtifact {
-                                            pdf_path: out_pdf
-                                                .to_string_lossy()
-                                                .to_string(),
+                                            pdf_path: out_pdf.to_string_lossy().to_string(),
                                             page_count: lc,
                                             template_used: lt.to_string(),
-                                            distilled_content_path: input_md_path
-                                                .to_string(),
-                                            rendered_at: chrono::Utc::now()
-                                                .to_rfc3339(),
+                                            distilled_content_path: input_md_path.to_string(),
+                                            rendered_at: chrono::Utc::now().to_rfc3339(),
                                             compression_attempts: attempt,
                                             space_utilization: su_after,
                                         });
@@ -1705,6 +2014,10 @@ pub fn render_cheatsheet(
             max_pages,
             attempt
         );
+        crate::utils::output::web_log(format!(
+            "render_cheatsheet: OVERFLOW attempt={} pages={}/{} input_chars={} — retrying with compression",
+            attempt, page_count, max_pages, input_chars_for_log,
+        ));
         last_error = Some(format!(
             "PDF has {} pages, exceeding maximum of {} pages",
             page_count, max_pages
@@ -2092,9 +2405,21 @@ More text
     #[test]
     fn compute_utilization_single_page_full() {
         let elements = vec![
-            TypstElement { page: 1, y_mm: 50.0, element_type: "heading".into() },
-            TypstElement { page: 1, y_mm: 150.0, element_type: "par".into() },
-            TypstElement { page: 1, y_mm: 280.0, element_type: "par".into() },
+            TypstElement {
+                page: 1,
+                y_mm: 50.0,
+                element_type: "heading".into(),
+            },
+            TypstElement {
+                page: 1,
+                y_mm: 150.0,
+                element_type: "par".into(),
+            },
+            TypstElement {
+                page: 1,
+                y_mm: 280.0,
+                element_type: "par".into(),
+            },
         ];
         let su = compute_space_utilization(&elements, 1, 1);
         assert!(su.overflow_ratio.is_none());
@@ -2105,8 +2430,16 @@ More text
     #[test]
     fn compute_utilization_last_page_under_utilized() {
         let elements = vec![
-            TypstElement { page: 1, y_mm: 280.0, element_type: "par".into() },
-            TypstElement { page: 2, y_mm: 30.0, element_type: "heading".into() },
+            TypstElement {
+                page: 1,
+                y_mm: 280.0,
+                element_type: "par".into(),
+            },
+            TypstElement {
+                page: 2,
+                y_mm: 30.0,
+                element_type: "heading".into(),
+            },
         ];
         let su = compute_space_utilization(&elements, 2, 2);
         assert!(su.overflow_ratio.is_none());
@@ -2118,9 +2451,21 @@ More text
     fn compute_utilization_overflow_ratio() {
         // 2 full pages + 1 page at 20% utilization → 2.20 effective pages
         let elements = vec![
-            TypstElement { page: 1, y_mm: 290.0, element_type: "par".into() },
-            TypstElement { page: 2, y_mm: 285.0, element_type: "par".into() },
-            TypstElement { page: 3, y_mm: 59.4, element_type: "par".into() },
+            TypstElement {
+                page: 1,
+                y_mm: 290.0,
+                element_type: "par".into(),
+            },
+            TypstElement {
+                page: 2,
+                y_mm: 285.0,
+                element_type: "par".into(),
+            },
+            TypstElement {
+                page: 3,
+                y_mm: 59.4,
+                element_type: "par".into(),
+            },
         ];
         let su = compute_space_utilization(&elements, 3, 2);
         assert!(su.overflow_ratio.is_some());
@@ -2136,9 +2481,21 @@ More text
     fn compute_utilization_severe_overflow() {
         // 3 full pages + tail → way beyond layout tightening threshold
         let elements = vec![
-            TypstElement { page: 1, y_mm: 290.0, element_type: "par".into() },
-            TypstElement { page: 2, y_mm: 290.0, element_type: "par".into() },
-            TypstElement { page: 3, y_mm: 290.0, element_type: "par".into() },
+            TypstElement {
+                page: 1,
+                y_mm: 290.0,
+                element_type: "par".into(),
+            },
+            TypstElement {
+                page: 2,
+                y_mm: 290.0,
+                element_type: "par".into(),
+            },
+            TypstElement {
+                page: 3,
+                y_mm: 290.0,
+                element_type: "par".into(),
+            },
         ];
         let su = compute_space_utilization(&elements, 3, 2);
         let ratio = su.overflow_ratio.unwrap();

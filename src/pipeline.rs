@@ -457,8 +457,7 @@ impl PipelineRunner {
         if result.render.ok() {
             if let Some(ref su) = result.render.space_utilization {
                 if su.last_page_under_utilized {
-                    let target_pct =
-                        (1.0 - su.last_page_utilization_pct / 100.0).max(0.1) * 100.0;
+                    let target_pct = (1.0 - su.last_page_utilization_pct / 100.0).max(0.1) * 100.0;
                     log::info!(
                         "under-utilised render detected (last page {:.1}%) — attempting LLM expansion (target +{:.0}%)",
                         su.last_page_utilization_pct,
@@ -481,13 +480,9 @@ impl PipelineRunner {
                                 max_pages,
                             );
                             if expanded_render.ok() {
-                                if let Some(ref expanded_su) =
-                                    expanded_render.space_utilization
-                                {
+                                if let Some(ref expanded_su) = expanded_render.space_utilization {
                                     if !expanded_su.last_page_under_utilized {
-                                        log::info!(
-                                            "expansion resolved under-utilisation"
-                                        );
+                                        log::info!("expansion resolved under-utilisation");
                                     } else {
                                         log::info!(
                                             "expansion improved but still under-utilised ({:.1}%)",
@@ -497,9 +492,7 @@ impl PipelineRunner {
                                 }
                                 result.render = expanded_render;
                             } else {
-                                log::warn!(
-                                    "re-render after expansion failed — keeping original"
-                                );
+                                log::warn!("re-render after expansion failed — keeping original");
                             }
                         }
                         Err(e) => {

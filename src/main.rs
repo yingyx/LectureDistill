@@ -107,6 +107,11 @@ enum Commands {
         #[arg(long = "transcripts-dir", default_value = "data/transcripts")]
         transcripts_dir: PathBuf,
     },
+    /// Run processing operations (same as GUI processing)
+    Process {
+        #[command(subcommand)]
+        cmd: ProcessCmd,
+    },
     /// Start the local Web GUI
     Gui {
         /// Host to bind the web server
@@ -121,6 +126,29 @@ enum Commands {
             default_value = ".lecture-distill/projects/default"
         )]
         project_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProcessCmd {
+    /// Run processing on sources in a project directory
+    Run {
+        /// Project directory containing sources and config
+        #[arg(
+            long = "project-dir",
+            default_value = ".lecture-distill/projects/default"
+        )]
+        project_dir: PathBuf,
+        /// Comma-separated output kinds with optional max pages
+        /// (e.g. "note_patch,reference_digest,cheating_sheet:2")
+        #[arg(long = "outputs")]
+        outputs: Option<String>,
+        /// Enable debug diagnostics and keep intermediate files
+        #[arg(long = "debug", default_value_t = false)]
+        debug: bool,
+        /// Re-run an existing process by ID (uses its saved source_ids and outputs)
+        #[arg(long = "process-id")]
+        process_id: Option<String>,
     },
 }
 
@@ -226,6 +254,17 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+
+        Commands::Process { cmd } => match cmd {
+            ProcessCmd::Run {
+                project_dir,
+                outputs,
+                debug,
+                process_id,
+            } => {
+                cmd_process_run(&project_dir, outputs.as_deref(), debug, process_id.as_deref()).await?;
+            }
+        },
 
         Commands::Gui {
             host,
@@ -385,6 +424,14 @@ fn cmd_render_cheatsheet(
             path.to_string_lossy().to_string(),
         );
         println!("Typst path: {}", path.display());
+    } else if std::env::var("LECTURE_DISTILL_TYPST_PATH").is_err() {
+        // Auto-detect from common locations when not explicitly provided.
+        // Check if typst is on PATH.
+        let typst = crate::latex::find_typst_compiler();
+        if !typst.is_empty() {
+            std::env::set_var("LECTURE_DISTILL_TYPST_PATH", &typst);
+            println!("Typst auto-detected: {}", typst);
+        }
     }
 
     let tp = template.map(|p| p.to_string_lossy().to_string());
@@ -448,6 +495,402 @@ async fn cmd_run(
     println!("Done! Cheat sheet: {}", out_pdf.display());
 
     Ok(())
+}
+
+/// `process run` - execute processing operations on sources (same as GUI processing).
+///
+/// When `process_id` is provided, re-runs an existing process in-place using its
+/// saved source_ids and outputs.  When omitted, creates a new process.
+async fn cmd_process_run(
+    project_dir: &PathBuf,
+    outputs: Option<&str>,
+    debug: bool,
+    process_id_override: Option<&str>,
+) -> Result<()> {
+    use std::sync::Arc;
+    use utils::output::{
+        cheating_sheet_markdown_path, expand_output_kinds, process_output_path_for,
+        process_output_title, update_process_terminal_status, CreateProcessOutputBody,
+    };
+    use web::processes::{
+        ProcessOutput, ProcessOutputKind, ProcessRecord, ProcessStatus as ProcessRecordStatus,
+        ProcessStore,
+    };
+    use web::sources::SourceStore;
+
+    // Initialize logger: debug mode shows info, normal mode shows warnings only.
+    if debug {
+        std::env::set_var("RUST_LOG", "info");
+        std::env::set_var("LECTURE_DISTILL_DEBUG", "1");
+    } else {
+        std::env::set_var("RUST_LOG", "warn");
+    }
+    let _ = env_logger::try_init();
+
+    let project_dir_str = project_dir.to_string_lossy().to_string();
+
+    // Load project config (typst_path, etc.) — mirrors the web app startup.
+    // The web app reads config.json and sets LECTURE_DISTILL_TYPST_PATH etc.
+    // We do the same here so the CLI behaves identically.
+    {
+        let config_path = std::path::Path::new(&project_dir_str).join("config.json");
+        if config_path.exists() {
+            if let Ok(config_json) = std::fs::read_to_string(&config_path) {
+                if let Ok(config) =
+                    serde_json::from_str::<serde_json::Value>(&config_json)
+                {
+                    if let Some(tp) = config.get("typst_path").and_then(|v| v.as_str()) {
+                        if !tp.trim().is_empty() {
+                            std::env::set_var("LECTURE_DISTILL_TYPST_PATH", tp.trim());
+                            println!("[config] typst_path: {}", tp.trim());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 1. Initialize stores (same pattern as create_app()).
+    let source_store = Arc::new(SourceStore::new(&project_dir_str));
+    let process_store = Arc::new(ProcessStore::new(&project_dir_str));
+
+    // ── Re-run existing process path ──
+    if let Some(pid) = process_id_override {
+        let existing = match process_store.get(pid) {
+            Some(p) => p,
+            None => anyhow::bail!(
+                "Process '{}' not found in project: {}\n\
+                 Use 'process run' without --process-id to create a new process.",
+                pid,
+                project_dir.display()
+            ),
+        };
+
+        println!("═══ Re-running existing process ═══");
+        println!("Process ID: {}", pid);
+        println!("Title: {}", existing.title);
+        println!("Sources: {}", existing.source_ids.len());
+        println!("Outputs: {}", existing.outputs.len());
+        for o in &existing.outputs {
+            println!(
+                "  - [{}] {} ({})",
+                match o.status {
+                    ProcessRecordStatus::Ready => "✓",
+                    ProcessRecordStatus::Failed => "✗",
+                    ProcessRecordStatus::Processing => "…",
+                },
+                o.title,
+                o.kind,
+            );
+            if o.kind == ProcessOutputKind::CheatingSheet {
+                if let Some(mp) = o.metadata.get("max_pages").and_then(|v| v.as_u64()) {
+                    println!("      max_pages: {}", mp);
+                }
+            }
+        }
+        println!();
+
+        // Reset all outputs to Processing state.
+        let now = ProcessRecord::now_iso();
+        let _ = process_store.update(pid, |r| {
+            r.status = ProcessRecordStatus::Processing;
+            r.last_error = None;
+            for o in &mut r.outputs {
+                o.status = ProcessRecordStatus::Processing;
+                o.last_error = None;
+                o.updated_at = now.clone();
+            }
+        });
+
+        let process = process_store.get(pid).unwrap();
+        let source_ids = process.source_ids.clone();
+        let outputs_vec = process.outputs.clone();
+
+        println!("Processing...\n");
+        pipelines::run_process_outputs(
+            pid,
+            &source_ids,
+            &outputs_vec,
+            &process_store,
+            &source_store,
+            "cli",
+        )
+        .await;
+
+        update_process_terminal_status(&process_store, pid, "cli");
+
+        // Print results.
+        print_process_results(&process_store, pid, project_dir_str, debug);
+        return Ok(());
+    }
+
+    // ── New process path (original behaviour) ──
+
+    // 2. Load and validate sources.
+    let sources = source_store.load_all();
+    if sources.is_empty() {
+        anyhow::bail!(
+            "No sources found in project directory: {}\n\
+             Use the GUI or 'canvas fetch-subtitles' to add sources first.",
+            project_dir.display()
+        );
+    }
+
+    // Collect all source IDs (CLI processes all sources in the project).
+    let source_ids: Vec<String> = sources.iter().map(|s| s.id.clone()).collect();
+
+    println!("Project: {}", project_dir.display());
+    println!("Sources: {} source(s)", source_ids.len());
+    for s in &sources {
+        println!("  - [{}] {} ({})", s.kind, s.title, s.id);
+    }
+    println!();
+
+    // 3. Parse --outputs into CreateProcessOutputBody items.
+    let outputs_str = outputs.unwrap_or("");
+    let requested: Vec<CreateProcessOutputBody> = outputs_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|token| {
+            if let Some((kind, pages)) = token.split_once(':') {
+                let max_pages: usize = pages
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid max_pages in '{}'", token))?;
+                Ok(CreateProcessOutputBody {
+                    kind: kind.trim().to_string(),
+                    max_pages: Some(max_pages),
+                })
+            } else {
+                Ok(CreateProcessOutputBody {
+                    kind: token.to_string(),
+                    max_pages: None,
+                })
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if requested.is_empty() {
+        anyhow::bail!(
+            "At least one output kind is required. Supported: note_patch, reference_digest, cheating_sheet[:N]"
+        );
+    }
+
+    // 4. Expand output kinds (auto-add dependencies like RefDigest for CheatSheet).
+    let expanded = match expand_output_kinds(&requested) {
+        Ok(kinds) => kinds,
+        Err(e) => anyhow::bail!("{}", e),
+    };
+
+    println!("Outputs requested:");
+    for (kind, max_pages) in &expanded {
+        if *max_pages > 0 {
+            println!("  - {} (max_pages: {})", process_output_title(kind), max_pages);
+        } else {
+            println!("  - {}", process_output_title(kind));
+        }
+    }
+    println!();
+
+    // 5. Create ProcessRecord + ProcessOutput[].
+    let process_id = uuid::Uuid::new_v4().to_string();
+    let now = ProcessRecord::now_iso();
+    let title = format!("CLI Process {}", &process_id[..8]);
+
+    let mut outputs_vec: Vec<ProcessOutput> = Vec::new();
+    for (kind, max_pages) in &expanded {
+        let output_id = uuid::Uuid::new_v4().to_string();
+        let output_path =
+            process_output_path_for(&process_store, &process_id, &output_id, kind);
+        let diff_path = if *kind == ProcessOutputKind::NotePatch {
+            Some(process_store.diff_path(&process_id, &output_id))
+        } else {
+            None
+        };
+
+        // Ensure artifact directories exist.
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let markdown_path =
+            cheating_sheet_markdown_path(&process_store, &process_id, &output_id);
+
+        let metadata = if *kind == ProcessOutputKind::ReferenceDigest {
+            serde_json::json!({
+                "progress_current": 0,
+                "progress_total": 2,
+                "progress_label": "queued",
+            })
+        } else if *kind == ProcessOutputKind::CheatingSheet {
+            serde_json::json!({
+                "progress_current": 0,
+                "progress_total": 4,
+                "progress_label": "queued",
+                "max_pages": max_pages,
+                "markdown_path": markdown_path.to_string_lossy().to_string(),
+            })
+        } else {
+            serde_json::json!({
+                "progress_current": 0,
+                "progress_total": 1,
+                "progress_label": "queued",
+            })
+        };
+
+        outputs_vec.push(ProcessOutput {
+            id: output_id,
+            kind: kind.clone(),
+            status: ProcessRecordStatus::Processing,
+            title: process_output_title(kind).to_string(),
+            path: output_path.to_string_lossy().to_string(),
+            diff_path: diff_path.map(|p| p.to_string_lossy().to_string()),
+            base_source_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_error: None,
+            metadata,
+        });
+    }
+
+    let record = ProcessRecord {
+        id: process_id.clone(),
+        title,
+        status: ProcessRecordStatus::Processing,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        source_ids: source_ids.clone(),
+        outputs: outputs_vec.clone(),
+        last_error: None,
+        job_id: None,
+    };
+
+    process_store.insert(record)?;
+
+    // 6. Execute processing directly (no background job — CLI is already async).
+    println!("Processing...\n");
+    pipelines::run_process_outputs(
+        &process_id,
+        &source_ids,
+        &outputs_vec,
+        &process_store,
+        &source_store,
+        "cli",
+    )
+    .await;
+
+    update_process_terminal_status(&process_store, &process_id, "cli");
+
+    print_process_results(&process_store, &process_id, project_dir_str, debug);
+    Ok(())
+}
+
+/// Print process results (shared between new and re-run paths).
+fn print_process_results(
+    process_store: &crate::web::processes::ProcessStore,
+    process_id: &str,
+    project_dir_str: String,
+    debug: bool,
+) {
+    use crate::web::processes::{ProcessOutputKind, ProcessStatus as ProcessRecordStatus};
+
+    // 7. Read results and print.
+    let process = process_store.get(&process_id).unwrap();
+    println!();
+    println!("═══════════════════════════════════════════");
+    println!("  Results");
+    println!("═══════════════════════════════════════════");
+    for output in &process.outputs {
+        let status_icon = match output.status {
+            ProcessRecordStatus::Ready => "✓",
+            ProcessRecordStatus::Failed => "✗",
+            ProcessRecordStatus::Processing => "…",
+        };
+        println!(
+            "  [{}] {} ({})",
+            status_icon,
+            output.title,
+            output.status
+        );
+        println!("       Path: {}", output.path);
+
+        if output.status == ProcessRecordStatus::Failed {
+            if let Some(ref err) = output.last_error {
+                println!("       Error: {}", err);
+            }
+        }
+
+        if output.status == ProcessRecordStatus::Ready {
+            // Show output file size.
+            if let Ok(meta) = std::fs::metadata(&output.path) {
+                println!("       Size: {} bytes", meta.len());
+            }
+
+            // For CheatSheet, read the rendered artifact for diagnostics.
+            if output.kind == ProcessOutputKind::CheatingSheet {
+                let markdown_path = output
+                    .metadata
+                    .get("markdown_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !markdown_path.is_empty() {
+                    if let Ok(md_content) = std::fs::read_to_string(markdown_path) {
+                        let char_count = md_content.chars().count();
+                        println!("       Cheat Sheet markdown: {} chars", char_count);
+                    }
+                }
+            }
+        }
+
+        if debug && output.status == ProcessRecordStatus::Ready {
+            // Print metadata for diagnostics.
+            if let Some(max_pages) = output
+                .metadata
+                .get("max_pages")
+                .and_then(|v| v.as_u64())
+            {
+                println!("       Max pages: {}", max_pages);
+            }
+
+            // For CheatSheet outputs, read markdown for char count and
+            // attempt to extract space_utilization from any saved artifact.
+            if output.kind == ProcessOutputKind::CheatingSheet {
+                let markdown_path = output
+                    .metadata
+                    .get("markdown_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !markdown_path.is_empty() {
+                    if let Ok(md_content) = std::fs::read_to_string(markdown_path) {
+                        let char_count = md_content.chars().count();
+                        // Count PDF page count if possible.
+                        if let Ok(pdf_bytes) = std::fs::read(&output.path) {
+                            // Minimal PDF page count: count "/Type /Page" occurrences.
+                            // This is a rough heuristic; for accurate counts use a PDF library.
+                            let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+                            let page_count = pdf_text.matches("/Type /Page").count()
+                                + pdf_text.matches("/Type/Page").count();
+                            let page_count = if page_count == 0 {
+                                1usize
+                            } else {
+                                page_count
+                            };
+                            let chars_per_page = char_count as f64 / page_count as f64;
+                            println!(
+                                "       Generated chars: {}, Page count: {}, Chars/page: {:.0}",
+                                char_count, page_count, chars_per_page
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        println!();
+    }
+
+    println!("Process ID: {}", process_id);
+    println!("Artifacts directory: {}/artifacts/processes/{}", project_dir_str, process_id);
 }
 
 /// `gui` - start the local Web GUI.

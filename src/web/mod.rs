@@ -1,5 +1,6 @@
 pub mod app;
 pub mod course;
+pub mod handlers;
 pub mod jobs;
 pub mod processes;
 pub mod secrets;

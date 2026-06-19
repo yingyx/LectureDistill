@@ -98,8 +98,8 @@ impl ChatConversation {
     /// The file is overwritten if it already exists (idempotent for the same
     /// process — one conversation per process directory).
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("failed to serialize conversation")?;
+        let json =
+            serde_json::to_string_pretty(self).context("failed to serialize conversation")?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create dir: {}", parent.display()))?;
@@ -1568,8 +1568,8 @@ mod tests {
 
     #[test]
     fn test_conversation_load_missing_file_returns_none() {
-        let result = ChatConversation::load_from_file(Path::new("/nonexistent/conversation.json"))
-            .unwrap();
+        let result =
+            ChatConversation::load_from_file(Path::new("/nonexistent/conversation.json")).unwrap();
         assert!(result.is_none());
     }
 

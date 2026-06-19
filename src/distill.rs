@@ -206,10 +206,7 @@ pub async fn distill_expand(
         match llm_expand(&content, expansion_target_pct).await {
             Ok(text) => text,
             Err(e) => {
-                log::warn!(
-                    "LLM expansion failed, keeping original content: {}",
-                    e
-                );
+                log::warn!("LLM expansion failed, keeping original content: {}", e);
                 content.clone()
             }
         }
