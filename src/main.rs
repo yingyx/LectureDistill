@@ -202,8 +202,60 @@ enum CanvasCmd {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Open a URL in the default system browser.
+fn open_browser(url: &str) {
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    match result {
+        Ok(_) => log::info!("Browser opened: {}", url),
+        Err(e) => log::warn!("Failed to open browser ({}): {}", url, e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // When launched with no arguments (e.g. double-clicking the .exe on Windows),
+    // automatically start the GUI and open the browser.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() <= 1 {
+        let host = "127.0.0.1";
+        let port: u16 = 8765;
+        let project_dir = ".lecture-distill/projects/default";
+
+        let _ = env_logger::try_init();
+
+        println!("========================================");
+        println!("  lecture-distill GUI v{}", env!("CARGO_PKG_VERSION"));
+        println!("========================================");
+        println!("  Starting at http://{}:{}", host, port);
+        println!("  Project dir: {}", project_dir);
+        println!("  Press Ctrl+C to stop.");
+        println!();
+
+        let url = format!("http://{}:{}", host, port);
+
+        // Open browser after a short delay to let the server start.
+        let browser_url = url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            open_browser(&browser_url);
+        });
+
+        let app = web::app::create_app(project_dir);
+        let listener = tokio::net::TcpListener::bind(&format!("{}:{}", host, port)).await?;
+        println!("Listening on http://{}:{}\n", host, port);
+
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
