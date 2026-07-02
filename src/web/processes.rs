@@ -143,6 +143,18 @@ impl ProcessStore {
         }
     }
 
+    /// Return the project root directory.
+    ///
+    /// `artifacts_dir` is `<project_dir>/artifacts/processes` — walk up two
+    /// levels to get back to the project root.
+    pub fn project_dir(&self) -> PathBuf {
+        self.artifacts_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Ensure the artifacts directory exists.
     pub fn ensure_dirs(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {

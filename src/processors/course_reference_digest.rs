@@ -182,15 +182,29 @@ pub(crate) async fn run_course_reference_digest(
             }
             Err(e) => {
                 web_log(format!(
-                    "job {} reference-digest: section '{}' generation failed: {}",
+                    "job {} reference-digest: section '{}' generation failed (attempt 1): {}",
                     job_id, section.title, e
                 ));
-                let err_msg = format!(
-                    "Section '{}' generation failed: {}. {}/{} sections succeeded.",
-                    section.title, e, success_count, total_sections
-                );
-                fail_rd_outputs(process_store, process_id, outputs, &err_msg);
-                return;
+                // Retry once with smaller max_tokens to avoid response-decode errors.
+                match generate_course_ref_digest_section_retry(section, &context, style_guide).await
+                {
+                    Ok(markdown) => {
+                        web_log(format!(
+                            "job {} reference-digest: section '{}' retry succeeded",
+                            job_id, section.title,
+                        ));
+                        generated_sections.push(markdown);
+                        success_count += 1;
+                    }
+                    Err(retry_err) => {
+                        web_log(format!(
+                            "job {} reference-digest: section '{}' retry also failed: {} — continuing with {} sections",
+                            job_id, section.title, retry_err, success_count,
+                        ));
+                        // Don't fail the whole pipeline — skip this section.
+                        // Only fail if we have NO successful sections.
+                    }
+                }
             }
         }
     }
@@ -214,6 +228,82 @@ pub(crate) async fn run_course_reference_digest(
                 return;
             }
         };
+
+    // --- Ref Digest Quality Gate (multi-pass expansion) ---
+    let source_chars: usize = indexes.iter().map(|idx| idx.char_count).sum();
+    let max_pages_for_quality = 2;
+    const MAX_QUALITY_PASSES: usize = 3;
+
+    let (quality_ok, mut quality_reason) = crate::utils::budget::check_ref_digest_quality(
+        digest_markdown.chars().count(),
+        source_chars.max(1),
+        max_pages_for_quality,
+    );
+    web_log(format!(
+        "job {} reference-digest (course): quality gate — source_chars={} {}",
+        job_id, source_chars, quality_reason,
+    ));
+
+    let mut digest_markdown = digest_markdown;
+    if !quality_ok {
+        let system = crate::prompts::ref_digest::build_ref_digest_system_prompt();
+        for pass in 0..MAX_QUALITY_PASSES {
+            let current_chars = digest_markdown.chars().count();
+            let target_min = max_pages_for_quality
+                .saturating_mul(11000)
+                .saturating_mul(60)
+                / 100;
+            let ratio_min = source_chars.saturating_mul(75) / 1000; // 7.5%
+            let threshold = target_min.max(ratio_min);
+            let gap = threshold.saturating_sub(current_chars);
+            if gap == 0 {
+                break;
+            }
+            // Target ~30% of remaining gap per pass.
+            let target_add = ((gap as f64) * 0.30).max(2000.0).min(15000.0) as usize;
+
+            let retry_prompt = crate::prompts::ref_digest::build_ref_digest_retry_prompt(
+                &digest_markdown,
+                source_chars,
+                current_chars,
+                target_add,
+            );
+            match llm::chat_text(&system, &retry_prompt, 0.25, 81920).await {
+                Ok(text) => {
+                    let retry_md = strip_markdown_fences(&text);
+                    let retry_chars = retry_md.chars().count();
+                    let added = retry_chars.saturating_sub(current_chars);
+                    web_log(format!(
+                        "job {} reference-digest (course): quality expansion pass {}/{} — {} → {} chars (+{})",
+                        job_id, pass + 1, MAX_QUALITY_PASSES, current_chars, retry_chars, added,
+                    ));
+                    if retry_chars <= current_chars {
+                        break;
+                    }
+                    digest_markdown = retry_md;
+                    let (new_ok, new_reason) = crate::utils::budget::check_ref_digest_quality(
+                        retry_chars,
+                        source_chars.max(1),
+                        max_pages_for_quality,
+                    );
+                    quality_reason = new_reason;
+                    if new_ok {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    web_log(format!(
+                        "job {} reference-digest (course): quality expansion pass {} failed: {}",
+                        job_id,
+                        pass + 1,
+                        e,
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    // --- End Quality Gate ---
 
     // Step 5 - Write outputs.
     update_ref_digest_progress(
@@ -449,6 +539,55 @@ pub(crate) async fn generate_course_ref_digest_section(
     );
 
     let text = llm::chat_text(&system, &user, 0.25, 24576).await?;
+    Ok(strip_markdown_fences(&text))
+}
+
+/// Retry variant with streaming to avoid HTTP body-decode errors on large responses.
+async fn generate_course_ref_digest_section_retry(
+    section: &PlannedSection,
+    context: &str,
+    style_guide: &str,
+) -> Result<String> {
+    let system = format!(
+        "You are a Reference Digest writer. Write a detailed Markdown section.\n\
+        Section title: {}\nPurpose: {}\n\
+        Use ## {} for the section heading and ### for subsections.\n\
+        Write detailed Reference Digest content - include definitions, formulas, conditions, \
+        algorithms, steps, comparisons, pitfalls, exam judgement rules, and timestamp evidence.\n\
+        Default language: Chinese, preserving English technical terms, formulas, symbols, and code identifiers.\n\
+        Must include these concepts: {}\n\
+        Do not invent facts beyond the provided context.\n\
+        {}",
+        section.title,
+        section.purpose,
+        section.title,
+        section.must_include.join(", "),
+        style_guide
+    );
+
+    let user = format!(
+        "Write the Reference Digest Markdown section. Context:\n{}",
+        truncate_for_llm(context, 32000)
+    );
+
+    // Use chat_completion_with_metadata with max_tokens >= LARGE_OUTPUT_THRESHOLD
+    // to force internal streaming and avoid HTTP body-decode errors.
+    let (text, _) = llm::chat_completion_with_metadata(
+        &[
+            llm::ChatMessage {
+                role: "system".into(),
+                content: system,
+            },
+            llm::ChatMessage {
+                role: "user".into(),
+                content: user,
+            },
+        ],
+        0.25,
+        32768,
+        None,
+    )
+    .await?;
     Ok(strip_markdown_fences(&text))
 }
 

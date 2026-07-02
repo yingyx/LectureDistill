@@ -93,6 +93,44 @@ impl ChatConversation {
         }
     }
 
+    /// Send a user message and return the assistant's text response together with
+    /// the `finish_reason` from the API.
+    ///
+    /// Like [`turn`] but additionally returns `Option<finish_reason>` so callers
+    /// can distinguish natural completion from token-limit truncation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LLM call fails.  The conversation state is
+    /// **not** modified on failure (the user message is not persisted).
+    pub async fn turn_with_metadata(
+        &mut self,
+        user_message: &str,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<(String, Option<String>)> {
+        // Append user message tentatively — we'll remove it on failure.
+        self.messages.push(ChatMessage {
+            role: "user".into(),
+            content: user_message.to_string(),
+        });
+
+        match chat_completion_with_metadata(&self.messages, temperature, max_tokens, None).await {
+            Ok((response, finish_reason)) => {
+                self.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: response.clone(),
+                });
+                Ok((response, finish_reason))
+            }
+            Err(e) => {
+                // Roll back the user message on failure.
+                self.messages.pop();
+                Err(e)
+            }
+        }
+    }
+
     /// Persist this conversation to a JSON file on disk.
     ///
     /// The file is overwritten if it already exists (idempotent for the same

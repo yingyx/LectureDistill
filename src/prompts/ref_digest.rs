@@ -48,6 +48,33 @@ pub(crate) fn build_ref_digest_user_prompt(
     user
 }
 
+/// Build a corrective prompt for when Ref Digest is too short.
+///
+/// Asks the LLM to expand the digest to meet minimum length requirements,
+/// providing the current digest as context.
+pub(crate) fn build_ref_digest_retry_prompt(
+    current_digest: &str,
+    source_chars: usize,
+    current_chars: usize,
+    target_min_chars: usize,
+) -> String {
+    format!(
+        "Your Reference Digest is too short: {current} chars, but the source material \
+         contains {source} chars and the target minimum is {target} chars.\n\n\
+         Current digest:\n{current_digest}\n\n\
+         Please expand the digest significantly. Add MUCH more detail to each section: \
+         include ALL definitions, formulas, conditions, algorithms, step-by-step \
+         procedures, comparisons, pitfalls, and exam judgement rules from the source. \
+         Every concept mentioned in the source should appear in the digest. \
+         Be extremely thorough and comprehensive — do not skip any topic.\n\n\
+         Return the COMPLETE expanded digest as Markdown (not just additions).",
+        current = current_chars,
+        source = source_chars,
+        target = target_min_chars,
+        current_digest = current_digest
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

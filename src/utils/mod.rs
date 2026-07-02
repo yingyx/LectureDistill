@@ -4,6 +4,7 @@
 //! They take plain Rust/domain types and return computed values.
 
 pub mod budget;
+pub mod calibration;
 pub mod markdown;
 pub mod outline;
 pub mod output;

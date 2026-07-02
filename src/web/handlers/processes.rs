@@ -710,6 +710,7 @@ pub(crate) async fn api_stream_process_output(
     use crate::prompts::ref_digest::{
         build_ref_digest_system_prompt, build_ref_digest_user_prompt,
     };
+    use crate::utils::calibration::CalibrationData;
     use crate::utils::markdown::strip_markdown_fences;
     use std::convert::Infallible;
     use tokio::sync::mpsc;
@@ -837,7 +838,16 @@ pub(crate) async fn api_stream_process_output(
                         .map(|v| v as usize)
                         .unwrap_or(2)
                         .clamp(1, 20);
-                    let (sys, usr) = build_cheat_sheet_prompts(&digest_md, max_pages);
+                    let calib = CalibrationData {
+                        template: "__fallback__".into(),
+                        calibrated_at: "never".into(),
+                        cjk_chars_per_page: 8500,
+                        english_words_per_page: 1700,
+                        english_chars_per_page: 8500,
+                        page_height_mm: 290.0,
+                        page_width_mm: 200.0,
+                    };
+                    let (sys, usr) = build_cheat_sheet_prompts(&digest_md, max_pages, &calib);
                     let rx = crate::llm::chat_text_stream(&sys, &usr, 0.2, 65536).await?;
                     Ok(("cheat_sheet".to_string(), rx))
                 }

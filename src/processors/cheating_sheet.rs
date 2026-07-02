@@ -18,10 +18,11 @@ use crate::prompts::cheat_sheet::{
     build_expansion_turn3_prompt,
 };
 use crate::utils::budget::{
-    build_cheatsheet_metadata, build_section_inventory, estimate_cheating_sheet_budget,
-    extract_high_density_content, should_attempt_expansion,
-    truncate_ref_digest_for_cheatsheet, CheatingSheetGenerationResult,
+    build_cheatsheet_metadata, build_section_inventory, compute_budget, count_effective,
+    extract_high_density_content, should_attempt_expansion, truncate_ref_digest_for_cheatsheet,
+    CheatingSheetGenerationResult,
 };
+use crate::utils::calibration::{ensure_calibration, CalibrationData};
 use crate::utils::markdown::strip_markdown_fences;
 use crate::utils::output::{
     cheating_sheet_markdown_path, process_output_path_for, update_single_output_progress, web_log,
@@ -134,13 +135,18 @@ pub(crate) async fn run_cheating_sheet_outputs(
             .clamp(1, 20);
 
         let ref_digest_chars = ref_digest_markdown.chars().count();
-        let budget = estimate_cheating_sheet_budget(max_pages);
-        let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
+
+        // Load or auto-calibrate the template and compute a language-aware budget.
+        let calibration = ensure_calibration(None, &process_store.project_dir());
+        let effective = count_effective(&ref_digest_markdown);
+        let budget = compute_budget(&calibration, &effective, max_pages);
+        let lang = budget.language;
+        let source_too_short = ref_digest_chars < budget.min_acceptable;
 
         web_log(format!(
-            "job {} cheating-sheet: budget max_pages={} target={} soft_max={} min_acceptable={} ref_digest_chars={} source_too_short={}",
-            job_id, max_pages, budget.target_chars, budget.soft_max_chars,
-            budget.min_acceptable_chars, ref_digest_chars, source_too_short,
+            "job {} cheating-sheet: budget max_pages={} target={} soft_max={} min_acceptable={} ref_digest_chars={} lang={:?} source_too_short={}",
+            job_id, max_pages, budget.target, budget.soft_max,
+            budget.min_acceptable, ref_digest_chars, lang, source_too_short,
         ));
 
         // Saved fork with Turn 2 exchange, for use in Turn 3 (Expansion).
@@ -164,28 +170,30 @@ pub(crate) async fn run_cheating_sheet_outputs(
                     &budget,
                 );
                 let mut fork = conv.fork();
-                let result = fork.turn(&turn2_user, 0.2, 81920).await.map(|text| {
+                let result = fork.turn_with_metadata(&turn2_user, 0.2, 81920).await.map(|(text, finish_reason)| {
                     let raw_chars = text.chars().count();
                     let md = strip_markdown_fences(&text);
                     let chars = md.chars().count();
                     web_log(format!(
-                        "job {} cheating-sheet: Turn 2 LLM — raw_chars={} stripped_chars={} target={}",
-                        job_id, raw_chars, chars, budget.target_chars,
+                        "job {} cheating-sheet: Turn 2 LLM — raw_chars={} stripped_chars={} target={} finish_reason={:?}",
+                        job_id, raw_chars, chars, budget.target, finish_reason,
                     ));
                     CheatingSheetGenerationResult {
                         markdown: md,
-                        target_chars: budget.target_chars,
+                        target_chars: budget.target,
                         generated_chars: chars,
                         harness_attempts: 1,
                         expansion_used: false,
                         underfilled_reason: None,
+                        language: lang,
                     }
                 });
                 // Save fork for potential Turn 3 (Expansion).
                 saved_turn2_fork = Some(fork);
                 result
             } else {
-                generate_cheating_sheet_markdown(&ref_digest_markdown, max_pages).await
+                generate_cheating_sheet_markdown(&ref_digest_markdown, max_pages, &calibration)
+                    .await
             };
 
             match llm_result {
@@ -223,7 +231,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
                         &fallback_md,
                         &markdown_path,
                         max_pages,
-                        budget.target_chars,
+                        budget.target,
                         fallback_chars,
                         0,
                         false,
@@ -275,7 +283,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
             Ok(artifact) => {
                 let decision = should_attempt_expansion(
                     gen_result.generated_chars,
-                    budget.min_acceptable_chars,
+                    budget.min_acceptable,
                     artifact.page_count,
                     max_pages,
                     source_too_short,
@@ -330,13 +338,13 @@ pub(crate) async fn run_cheating_sheet_outputs(
 
             for pass in 0..MAX_EXPANSION_PASSES {
                 let current_chars = current_md.chars().count();
-                let gap = budget.target_chars.saturating_sub(current_chars);
+                let gap = budget.target.saturating_sub(current_chars);
 
                 // Stop if we've reached or exceeded the target.
                 if gap == 0 {
                     web_log(format!(
                         "job {} cheating-sheet: expansion pass {} — target reached ({} chars >= {} target)",
-                        job_id, pass, current_chars, budget.target_chars,
+                        job_id, pass, current_chars, budget.target,
                     ));
                     break;
                 }
@@ -350,14 +358,36 @@ pub(crate) async fn run_cheating_sheet_outputs(
                     gap.min(12000).max(4000)
                 };
 
+                // Check for overflow: if chars/page already exceeds soft_max per page,
+                // stop expanding — more content would just cause truncation.
+                let soft_max_per_page = budget.soft_max / max_pages.max(1);
+                let chars_per_page = current_chars as f64 / last_page_count.unwrap_or(1) as f64;
+                if chars_per_page > soft_max_per_page as f64 {
+                    web_log(format!(
+                        "job {} cheating-sheet: expansion pass {} — stopping: chars/page={:.0} > soft_max_per_page={} (content likely overflowing)",
+                        job_id, pass + 1, chars_per_page, soft_max_per_page,
+                    ));
+                    break;
+                }
+
                 web_log(format!(
-                    "job {} cheating-sheet: expansion pass {}/{} — current_chars={} target={} gap={} target_add={}",
-                    job_id, pass + 1, MAX_EXPANSION_PASSES, current_chars, budget.target_chars, gap, target_add,
+                    "job {} cheating-sheet: expansion pass {}/{} — current_chars={} target={} gap={} target_add={} chars/page={:.0}",
+                    job_id, pass + 1, MAX_EXPANSION_PASSES, current_chars, budget.target, gap, target_add, chars_per_page,
                 ));
 
                 let expanded_result = if let Some(ref mut fork) = saved_turn2_fork {
-                    let turn3_user = build_expansion_turn3_prompt(target_add, &inventory);
-                    fork.turn(&turn3_user, 0.2, 81920).await
+                    let turn3_user = build_expansion_turn3_prompt(target_add, &inventory, lang);
+                    fork.turn_with_metadata(&turn3_user, 0.2, 81920)
+                        .await
+                        .map(|(text, fr)| {
+                            web_log(format!(
+                                "job {} cheating-sheet: expansion pass {} — finish_reason={:?}",
+                                job_id,
+                                pass + 1,
+                                fr,
+                            ));
+                            text
+                        })
                 } else {
                     let ref_digest_excerpt =
                         truncate_ref_digest_for_cheatsheet(&ref_digest_markdown, 90000).0;
@@ -366,8 +396,21 @@ pub(crate) async fn run_cheating_sheet_outputs(
                         &inventory,
                         &ref_digest_excerpt,
                         target_add,
+                        lang,
                     );
-                    llm::chat_text(&exp_system, &exp_user, 0.2, 81920).await
+                    llm::chat_completion_with_metadata(
+                        &[
+                            crate::llm::ChatMessage { role: "system".into(), content: exp_system },
+                            crate::llm::ChatMessage { role: "user".into(), content: exp_user },
+                        ],
+                        0.2, 81920, None,
+                    ).await.map(|(text, fr)| {
+                        web_log(format!(
+                            "job {} cheating-sheet: expansion pass {} (standalone) — finish_reason={:?}",
+                            job_id, pass + 1, fr,
+                        ));
+                        text
+                    })
                 };
 
                 match expanded_result {
@@ -398,7 +441,9 @@ pub(crate) async fn run_cheating_sheet_outputs(
                         if let Err(e) = fs::write(&markdown_path, &current_md) {
                             web_log(format!(
                                 "job {} cheating-sheet: failed to write expansion pass {}: {}",
-                                job_id, pass + 1, e,
+                                job_id,
+                                pass + 1,
+                                e,
                             ));
                             break;
                         }
@@ -423,7 +468,9 @@ pub(crate) async fn run_cheating_sheet_outputs(
                             Err(e) => {
                                 web_log(format!(
                                     "job {} cheating-sheet: expansion pass {} render failed: {}",
-                                    job_id, pass + 1, e,
+                                    job_id,
+                                    pass + 1,
+                                    e,
                                 ));
                                 break;
                             }
@@ -432,7 +479,9 @@ pub(crate) async fn run_cheating_sheet_outputs(
                     Err(e) => {
                         web_log(format!(
                             "job {} cheating-sheet: expansion pass {} LLM failed: {}",
-                            job_id, pass + 1, e,
+                            job_id,
+                            pass + 1,
+                            e,
                         ));
                         break;
                     }
@@ -441,9 +490,9 @@ pub(crate) async fn run_cheating_sheet_outputs(
 
             // ── Fallback: extract content from Reference Digest if still underfilled ──
             let final_chars = current_md.chars().count();
-            let fill_ratio = final_chars as f64 / budget.target_chars as f64;
-            if fill_ratio < MIN_FILL_RATIO && final_chars < budget.target_chars {
-                let gap = budget.target_chars.saturating_sub(final_chars);
+            let fill_ratio = final_chars as f64 / budget.target as f64;
+            if fill_ratio < MIN_FILL_RATIO && final_chars < budget.target {
+                let gap = budget.target.saturating_sub(final_chars);
                 web_log(format!(
                     "job {} cheating-sheet: fill ratio {:.1}% < {:.0}% — extracting {} chars from Reference Digest",
                     job_id, fill_ratio * 100.0, MIN_FILL_RATIO * 100.0, gap,
@@ -492,7 +541,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
             if let Some(ref reason) = underfilled_reason {
                 web_log(format!(
                     "job {} cheating-sheet: expansion skipped — reason={} ref_digest_chars={} min_acceptable={}",
-                    job_id, reason, ref_digest_chars, budget.min_acceptable_chars,
+                    job_id, reason, ref_digest_chars, budget.min_acceptable,
                 ));
             }
             let mut result = gen_result;
@@ -680,32 +729,112 @@ pub(crate) fn finish_cheating_sheet_render(
 ///
 /// This is the standalone (fresh) generation path used when no saved
 /// conversation exists from a unified pipeline run.
+///
+/// Accepts `calib` for language-aware budget computation.
 pub(crate) async fn generate_cheating_sheet_markdown(
     ref_digest_markdown: &str,
     max_pages: usize,
+    calib: &CalibrationData,
 ) -> Result<CheatingSheetGenerationResult> {
     if !llm::is_available() {
         bail!("LLM is not available");
     }
 
-    let budget = estimate_cheating_sheet_budget(max_pages);
-    let (system_prompt, user_prompt) = build_cheat_sheet_prompts(ref_digest_markdown, max_pages);
+    let effective = count_effective(ref_digest_markdown);
+    let budget = compute_budget(calib, &effective, max_pages);
+    let (system_prompt, user_prompt) =
+        build_cheat_sheet_prompts(ref_digest_markdown, max_pages, calib);
 
-    let text = llm::chat_text(&system_prompt, &user_prompt, 0.2, 81920).await?;
+    let (text, finish_reason) = llm::chat_completion_with_metadata(
+        &[
+            llm::ChatMessage {
+                role: "system".into(),
+                content: system_prompt.clone(),
+            },
+            llm::ChatMessage {
+                role: "user".into(),
+                content: user_prompt.clone(),
+            },
+        ],
+        0.2,
+        81920,
+        None,
+    )
+    .await?;
     let raw_chars = text.chars().count();
     let markdown = strip_markdown_fences(&text);
     let generated_chars = markdown.chars().count();
     log::info!(
-        "generate_cheating_sheet_markdown: raw_chars={} stripped_chars={} target={}",
-        raw_chars, generated_chars, budget.target_chars,
+        "generate_cheating_sheet_markdown: raw_chars={} stripped_chars={} target={} finish_reason={:?}",
+        raw_chars, generated_chars, budget.target, finish_reason,
     );
+
+    // Retry if severely underfilled.
+    let (markdown, generated_chars, harness_attempts) =
+        if crate::utils::budget::should_retry_cheat_sheet_generation(
+            generated_chars,
+            budget.target,
+            ref_digest_markdown.chars().count(),
+        ) {
+            log::info!(
+                "generate_cheating_sheet_markdown: retrying — {} chars is {:.0}% of target {}",
+                generated_chars,
+                (generated_chars as f64 / budget.target as f64) * 100.0,
+                budget.target,
+            );
+            let retry_user = format!(
+                "{}\n\nIMPORTANT: Your previous response was only {} characters. \
+                 The target is {} characters. Please generate a COMPLETE cheat sheet \
+                 that fills the target. Include ALL key concepts, formulas, and exam \
+                 points from the Reference Digest. Be thorough and comprehensive.",
+                user_prompt, generated_chars, budget.target,
+            );
+            match llm::chat_completion_with_metadata(
+                &[
+                    llm::ChatMessage {
+                        role: "system".into(),
+                        content: system_prompt.clone(),
+                    },
+                    llm::ChatMessage {
+                        role: "user".into(),
+                        content: retry_user,
+                    },
+                ],
+                0.2,
+                81920,
+                None,
+            )
+            .await
+            {
+                Ok((retry_text, fr)) => {
+                    let retry_raw = retry_text.chars().count();
+                    let retry_md = strip_markdown_fences(&retry_text);
+                    let retry_chars = retry_md.chars().count();
+                    log::info!(
+                        "generate_cheating_sheet_markdown: retry result — raw={} stripped={} finish_reason={:?}",
+                        retry_raw, retry_chars, fr,
+                    );
+                    (retry_md, retry_chars, 2)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "generate_cheating_sheet_markdown: retry failed: {} — using original",
+                        e
+                    );
+                    (markdown, generated_chars, 1)
+                }
+            }
+        } else {
+            (markdown, generated_chars, 1)
+        };
 
     Ok(CheatingSheetGenerationResult {
         markdown,
-        target_chars: budget.target_chars,
+        target_chars: budget.target,
         generated_chars,
-        harness_attempts: 1,
+        harness_attempts,
         expansion_used: false,
         underfilled_reason: None,
+        language: budget.language,
     })
 }

@@ -90,28 +90,61 @@ pub const DEFAULT_TEMPLATE: &str = r#"% !TEX program = xelatex
 /// Embedded default Typst template (preferred PDF renderer).
 pub const DEFAULT_TYPST_TEMPLATE: &str = r##"#set page(
   paper: "a4",
-  margin: (x: 0.5mm, y: 0.5mm),
+  margin: (left: 4mm, right: 4mm, top: 2mm, bottom: 3mm),
 )
 #set text(
   font: ("Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Arial", "New Computer Modern"),
-  size: 5pt,
+  size: 6.5pt,
   lang: "zh",
 )
 #set par(
-  leading: 0pt,
-  spacing: 0pt,
+  leading: 0.5pt,
+  spacing: 0.5pt,
   first-line-indent: 0pt,
   justify: false,
 )
+
+// Default heading spacing — overridden per-level below
 #show heading: set block(above: 0.8pt, below: 0.4pt)
-#show heading.where(level: 1): set text(fill: rgb("#004D80"), size: 7pt, weight: "bold")
-#show heading.where(level: 2): set text(fill: rgb("#004D80"), size: 6pt, weight: "bold")
-#show heading.where(level: 3): set text(fill: rgb("#0076BA"), size: 5.5pt, weight: "bold")
+
+// Section (## / h1): dark background, white text
+#show heading.where(level: 1): it => {
+  set block(above: 2.2pt, below: 1pt)
+  set text(fill: white, size: 7.5pt, weight: "bold")
+  box(fill: rgb("#222222"), width: 100%, outset: (y: 1pt, x: 1.5pt), it.body)
+}
+
+// Subsection (### / h2): light gray background, blue accent bar
+#show heading.where(level: 2): it => {
+  set block(above: 1.5pt, below: 0.5pt)
+  set text(fill: black, size: 6.8pt, weight: "bold")
+  box(fill: rgb("#E5E5E5"), width: 100%, outset: (y: 0.8pt, x: 1.5pt))[
+    #rect(width: 0.7mm, height: 1.6mm, fill: rgb("#005A9E"))
+    #h(0.6mm)
+    #it.body
+  ]
+}
+
+// Subsubsection (#### / h3): blue text, run-in style
+#show heading.where(level: 3): it => {
+  set block(above: 1pt, below: 0.2pt)
+  set text(fill: rgb("#005A9E"), size: 6.3pt, weight: "bold")
+  it
+}
+
 #show list: set block(spacing: 0pt)
 #show enum: set block(spacing: 0pt)
 
-#columns(4, gutter: 2mm)[
+#columns(3, gutter: 3.2mm)[
 {{content}}
+]
+
+#context [
+  #metadata((
+    "kind": "lecture-distill-end-marker",
+    "end_page": here().page(),
+    "end_y_pt": here().position().y.pt(),
+  ))
 ]
 "##;
 
@@ -490,86 +523,65 @@ fn parse_typst_length_to_mm(s: &str) -> Option<f64> {
     }
 }
 
-/// Run `typst query` on a compiled `.typ` file and return element positions.
+/// Run `typst query` on a compiled `.typ` file to find the end-marker metadata.
 ///
-/// Queries for `heading`, `list.item`, and `par` elements which cover
-/// essentially all text content in the default cheat-sheet template.
-fn run_typst_query(typ_path: &str, typst_exe: &str) -> Result<Vec<TypstElement>> {
-    // Try multiple selectors individually — Typst 0.14+ is picky about comma
-    // syntax and only certain element types are locatable.  We try each one
-    // and merge the results.
-    let selectors: &[&str] = &["figure", "table", "heading", "enum", "list"];
+/// The default template embeds a `#context [ #metadata(...) ]` block at the
+/// very end of the content area.  This function queries for all `metadata`
+/// elements tagged with `"lecture-distill-end-marker"` and returns the last
+/// one, which gives the final content page and y-position.
+///
+/// Returns `(end_page, end_y_mm)` where `end_y_mm` is the distance from the
+/// top of the page to the bottom of the last content element.
+fn query_end_marker(typ_path: &str, typst_exe: &str) -> Result<(usize, f64)> {
+    let output = std::process::Command::new(typst_exe)
+        .args(["query", typ_path, "metadata", "--field", "value"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("failed to run typst query metadata")?;
 
-    let mut all_elements = Vec::new();
-
-    for selector in selectors {
-        let output = match std::process::Command::new(typst_exe)
-            .args(["query", typ_path, selector, "--field", "location"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-
-        if !output.status.success() {
-            // Some selectors aren't locatable — skip silently.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("not locatable") || stderr.contains("failed to evaluate") {
-                continue;
-            }
-            // Other errors might indicate real issues — still try next selector.
-            log::debug!("typst query '{}' failed: {}", selector, stderr.trim());
-            continue;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let json: serde_json::Value = match serde_json::from_str(&stdout) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let arr = match json.as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-
-        for item in arr {
-            let func = item["func"].as_str().unwrap_or("unknown").to_string();
-            let loc = &item["location"];
-            let page = loc["page"].as_u64().unwrap_or(1) as usize;
-            let y_str = loc["y"].as_str().unwrap_or("0mm");
-
-            let y_mm = parse_typst_length_to_mm(y_str).unwrap_or(0.0);
-
-            all_elements.push(TypstElement {
-                page,
-                y_mm,
-                element_type: func,
-            });
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("typst query metadata failed: {}", stderr.trim());
     }
 
-    if all_elements.is_empty() {
-        bail!(
-            "typst query returned no locatable elements (selector(s) attempted: {:?}). \
-             This is expected with the default template — space utilisation will be \
-             estimated from page count and char budget.",
-            selectors
-        );
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let values: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout).context("failed to parse typst query output")?;
 
-    Ok(all_elements)
+    // Find the last end-marker metadata entry.
+    let last_marker = values
+        .iter()
+        .rev()
+        .find(|v| v.get("kind").and_then(|k| k.as_str()) == Some("lecture-distill-end-marker"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no lecture-distill-end-marker metadata found in typst query output \
+                 ({} metadata entries total). Template may not include the end marker.",
+                values.len()
+            )
+        })?;
+
+    let end_page: usize = last_marker["end_page"]
+        .as_u64()
+        .context("end_marker missing end_page")? as usize;
+    let end_y_pt: f64 = last_marker["end_y_pt"]
+        .as_f64()
+        .context("end_marker missing end_y_pt")?;
+
+    // Convert pt to mm: 1pt = 0.3528mm
+    let end_y_mm = end_y_pt * 0.3528;
+
+    Ok((end_page, end_y_mm))
 }
 
-/// Compute per-page space utilisation from `typst query` element positions.
-fn compute_space_utilization(
+/// Compute per-page space utilisation from element positions (legacy, for tests).
+#[cfg(test)]
+fn compute_space_utilization_from_elements(
     elements: &[TypstElement],
     page_count: usize,
     max_pages: usize,
 ) -> SpaceUtilization {
-    // Find the maximum page number present.
     let total_pages = elements
         .iter()
         .map(|e| e.page)
@@ -577,18 +589,16 @@ fn compute_space_utilization(
         .unwrap_or(page_count)
         .max(page_count);
 
-    // Group: for each page find the max y (deepest content).
     let mut page_max_y: Vec<f64> = vec![0.0; total_pages];
     let mut page_has_elements: Vec<bool> = vec![false; total_pages];
     for el in elements {
-        let idx = el.page - 1; // 0-based
+        let idx = el.page - 1;
         if idx < page_max_y.len() {
             page_max_y[idx] = page_max_y[idx].max(el.y_mm);
             page_has_elements[idx] = true;
         }
     }
 
-    // Build per-page utilisation data.
     let mut page_utilizations: Vec<PageUtilizationData> = Vec::with_capacity(total_pages);
     let mut total_content_pages = 0.0_f64;
 
@@ -596,9 +606,6 @@ fn compute_space_utilization(
         let max_y = if page_has_elements[p] {
             page_max_y[p]
         } else {
-            // Page with no elements detected — assume it's fully used
-            // (e.g. images, figures, or elements we didn't query).
-            // Fall back to a conservative ~95% estimate.
             A4_PAGE_HEIGHT_MM * 0.95
         };
         let util = (max_y / A4_PAGE_HEIGHT_MM * 100.0).min(100.0);
@@ -633,15 +640,71 @@ fn compute_space_utilization(
     }
 }
 
+/// Compute per-page space utilisation from the end-marker position.
+///
+/// Uses the end marker's `(end_page, end_y_mm)` to determine exactly where
+/// the content ends.  All pages before `end_page` are assumed full (100%);
+/// the last page's utilisation is `end_y_mm / A4_PAGE_HEIGHT_MM * 100`.
+///
+/// This assumes content fills pages continuously from page 1 through
+/// `end_page` without gaps — true for the cheat-sheet template's single
+/// `#columns(4, ...)[...]` content block.
+fn compute_space_utilization_from_end_marker(
+    end_page: usize,
+    end_y_mm: f64,
+    page_count: usize,
+    max_pages: usize,
+) -> SpaceUtilization {
+    let total_pages = end_page.max(page_count).max(1);
+
+    // Build per-page data: full pages + the last page with known utilisation.
+    let mut page_utilizations: Vec<PageUtilizationData> = Vec::with_capacity(total_pages);
+    let mut total_content_pages = 0.0_f64;
+
+    for p in 0..(total_pages - 1) {
+        // Full pages: ~100% utilisation.
+        page_utilizations.push(PageUtilizationData {
+            page: p + 1,
+            utilization_pct: 100.0,
+        });
+        total_content_pages += 1.0;
+    }
+
+    // Last page utilisation from end marker y-position.
+    let last_util = ((end_y_mm / A4_PAGE_HEIGHT_MM) * 100.0).min(100.0).max(0.0);
+    page_utilizations.push(PageUtilizationData {
+        page: total_pages,
+        utilization_pct: last_util,
+    });
+    total_content_pages += last_util / 100.0;
+
+    let last_page_utilization_pct = last_util;
+
+    let overflow_ratio = if page_count > max_pages {
+        Some(total_content_pages / max_pages as f64)
+    } else {
+        None
+    };
+
+    let last_page_under_utilized = page_count <= max_pages
+        && last_page_utilization_pct < UNDERFLOW_UTILIZATION_THRESHOLD * 100.0;
+
+    SpaceUtilization {
+        total_content_pages,
+        max_pages,
+        overflow_ratio,
+        page_utilizations,
+        last_page_under_utilized,
+        last_page_utilization_pct,
+    }
+}
+
 /// Fallback space utilisation estimate when `typst query` is unavailable.
 ///
 /// Uses a char-budget model: each page holds ~11000 chars comfortably.
 /// When `input_chars` is provided, the estimate is more accurate; otherwise
 /// falls back to coarse page-count heuristics.
-fn estimate_space_utilization_from_pages(
-    page_count: usize,
-    max_pages: usize,
-) -> SpaceUtilization {
+fn estimate_space_utilization_from_pages(page_count: usize, max_pages: usize) -> SpaceUtilization {
     let total_content_pages = page_count as f64;
     let overflow_ratio = if page_count > max_pages {
         Some(page_count as f64 / max_pages.max(1) as f64)
@@ -702,12 +765,16 @@ fn try_compute_space_utilization(
     page_count: usize,
     max_pages: usize,
 ) -> Option<SpaceUtilization> {
-    match run_typst_query(typ_path, typst_exe) {
-        Ok(elements) => {
-            let elem_count = elements.len();
-            let su = compute_space_utilization(&elements, page_count, max_pages);
+    match query_end_marker(typ_path, typst_exe) {
+        Ok((end_page, end_y_mm)) => {
+            let su = compute_space_utilization_from_end_marker(
+                end_page, end_y_mm, page_count, max_pages,
+            );
+            let page_count_detected = su.page_utilizations.len();
             log::info!(
-                "space utilisation: total_content_pages={:.2}, overflow_ratio={:?}, last_page={:.1}%{}",
+                "space utilisation (end-marker): end_page={} end_y_mm={:.1} total_content_pages={:.2}, overflow_ratio={:?}, last_page={:.1}%{}",
+                end_page,
+                end_y_mm,
                 su.total_content_pages,
                 su.overflow_ratio,
                 su.last_page_utilization_pct,
@@ -727,9 +794,10 @@ fn try_compute_space_utilization(
             }
             // Also emit via web_log for CLI/stderr visibility.
             crate::utils::output::web_log(format!(
-                "space_util: elements={} pages={} total_content_pages={:.2} overflow_ratio={:?} last_page_util={:.1}% under_utilized={}",
-                elem_count,
-                su.page_utilizations.len(),
+                "space_util: end_marker end_page={} end_y_mm={:.1} pages={} total_content_pages={:.2} overflow_ratio={:?} last_page_util={:.1}% under_utilized={}",
+                end_page,
+                end_y_mm,
+                page_count_detected,
                 su.total_content_pages,
                 su.overflow_ratio,
                 su.last_page_utilization_pct,
@@ -738,18 +806,14 @@ fn try_compute_space_utilization(
             for page_data in &su.page_utilizations {
                 crate::utils::output::web_log(format!(
                     "space_util:   page {}: {:.1}% utilised",
-                    page_data.page,
-                    page_data.utilization_pct,
+                    page_data.page, page_data.utilization_pct,
                 ));
             }
             Some(su)
         }
         Err(e) => {
             log::warn!("typst query skipped: {:#}", e);
-            crate::utils::output::web_log(format!(
-                "space_util: typst query failed — {:#}",
-                e,
-            ));
+            crate::utils::output::web_log(format!("space_util: typst query failed — {:#}", e,));
             // Fallback: estimate space utilisation from page count and char budget.
             // This is less precise than typst query but still useful for diagnostics.
             let fallback = estimate_space_utilization_from_pages(page_count, max_pages);
@@ -770,32 +834,62 @@ fn try_compute_space_utilization(
 /// Only called when using the embedded [`DEFAULT_TYPST_TEMPLATE`]; custom user
 /// templates are never modified.
 ///
-/// * `level` 1 — mild tightening (gutter 1.2mm, body 4.8pt, tighter heading spacing)
-/// * `level` 2 — aggressive tightening (gutter 0.8mm, body 4.5pt, very tight headings)
+/// * `level` 1 — mild tightening (gutter 2.2mm, body 6.2pt, tighter heading spacing)
+/// * `level` 2 — aggressive tightening (gutter 1.5mm, body 5.8pt, very tight headings)
 fn generate_tighter_typst_template(base: &str, level: usize) -> String {
     let mut result = base.to_string();
 
     match level {
         1 => {
-            // Mild: gutter 2mm -> 1.2mm
-            result = result.replace("gutter: 2mm", "gutter: 1.2mm");
-            // Body text: size: 5pt -> 4.8pt
-            result = result.replace("size: 5pt,\n  lang:", "size: 4.8pt,\n  lang:");
-            // Heading block: above: 0.8pt, below: 0.4pt -> 0.5pt, 0.2pt
+            // Mild: gutter 3.2mm -> 2.2mm
+            result = result.replace("gutter: 3.2mm", "gutter: 2.2mm");
+            // Body text: size: 6.5pt -> 6.2pt
+            result = result.replace("size: 6.5pt,\n  lang:", "size: 6.2pt,\n  lang:");
+            // Default heading block: above: 0.8pt, below: 0.4pt -> 0.5pt, 0.2pt
             result = result.replace(
                 "set block(above: 0.8pt, below: 0.4pt)",
                 "set block(above: 0.5pt, below: 0.2pt)",
             );
+            // h1 block: above: 2.2pt, below: 1pt -> 1.5pt, 0.6pt
+            result = result.replace(
+                "set block(above: 2.2pt, below: 1pt)",
+                "set block(above: 1.5pt, below: 0.6pt)",
+            );
+            // h2 block: above: 1.5pt, below: 0.5pt -> 1pt, 0.3pt
+            result = result.replace(
+                "set block(above: 1.5pt, below: 0.5pt)",
+                "set block(above: 1pt, below: 0.3pt)",
+            );
+            // h3 block: above: 1pt, below: 0.2pt -> 0.6pt, 0.1pt
+            result = result.replace(
+                "set block(above: 1pt, below: 0.2pt)",
+                "set block(above: 0.6pt, below: 0.1pt)",
+            );
         }
         2 => {
-            // Aggressive: gutter 2mm -> 0.8mm
-            result = result.replace("gutter: 2mm", "gutter: 0.8mm");
-            // Body text: size: 5pt -> 4.5pt
-            result = result.replace("size: 5pt,\n  lang:", "size: 4.5pt,\n  lang:");
-            // Heading block: above: 0.8pt, below: 0.4pt -> 0.3pt, 0.1pt
+            // Aggressive: gutter 3.2mm -> 1.5mm
+            result = result.replace("gutter: 3.2mm", "gutter: 1.5mm");
+            // Body text: size: 6.5pt -> 5.8pt
+            result = result.replace("size: 6.5pt,\n  lang:", "size: 5.8pt,\n  lang:");
+            // Default heading block: above: 0.8pt, below: 0.4pt -> 0.3pt, 0.1pt
             result = result.replace(
                 "set block(above: 0.8pt, below: 0.4pt)",
                 "set block(above: 0.3pt, below: 0.1pt)",
+            );
+            // h1 block: above: 2.2pt, below: 1pt -> 0.8pt, 0.3pt
+            result = result.replace(
+                "set block(above: 2.2pt, below: 1pt)",
+                "set block(above: 0.8pt, below: 0.3pt)",
+            );
+            // h2 block: above: 1.5pt, below: 0.5pt -> 0.5pt, 0.2pt
+            result = result.replace(
+                "set block(above: 1.5pt, below: 0.5pt)",
+                "set block(above: 0.5pt, below: 0.2pt)",
+            );
+            // h3 block: above: 1pt, below: 0.2pt -> 0.3pt, 0pt
+            result = result.replace(
+                "set block(above: 1pt, below: 0.2pt)",
+                "set block(above: 0.3pt, below: 0pt)",
             );
         }
         _ => {} // unknown level - no change
@@ -1399,6 +1493,24 @@ fn translate_latex_math_to_typst(math: &str) -> String {
         (r"\rceil", "⌉"),
         (r"\lfloor", "⌊"),
         (r"\rfloor", "⌋"),
+        // LaTeX math functions → Typst built-in functions
+        (r"\sin", "sin"),
+        (r"\cos", "cos"),
+        (r"\tan", "tan"),
+        (r"\arcsin", "arcsin"),
+        (r"\arccos", "arccos"),
+        (r"\arctan", "arctan"),
+        (r"\log", "log"),
+        (r"\ln", "ln"),
+        (r"\lg", "lg"),
+        (r"\lim", "lim"),
+        (r"\max", "max"),
+        (r"\min", "min"),
+        (r"\sup", "sup"),
+        (r"\inf", "inf"),
+        (r"\det", "det"),
+        (r"\gcd", "gcd"),
+        (r"\mod", "mod"),
     ];
 
     let mut result = math.to_string();
@@ -1409,6 +1521,34 @@ fn translate_latex_math_to_typst(math: &str) -> String {
     for (latex, typst) in &sorted {
         result = result.replace(latex, typst);
     }
+
+    // Fix: In Typst math mode, adjacent Latin letters are treated as a SINGLE
+    // multi-character variable (e.g. "ax" means variable "ax", not a·x).
+    // In LaTeX math mode they're implicit multiplication (a·x).  We've already
+    // translated known LaTeX commands above; remaining letter pairs should be
+    // separated.  However, Typst built-in math functions (sin, cos, etc.) must
+    // be preserved — we only separate pairs that are NOT common math tokens.
+    //
+    // Strategy: replace known math function names with sentinel-wrapped
+    // placeholders, separate remaining letter pairs, then restore.
+    // We use \x01 (SOH) as a sentinel byte so the letter-pair regex
+    // `([a-zA-Z])([a-zA-Z])` doesn't match across sentinel boundaries.
+    let math_funcs = &[
+        "sin", "cos", "tan", "arcsin", "arccos", "arctan", "log", "ln", "lg", "lim", "max", "min",
+        "sup", "inf", "det", "gcd", "mod",
+    ];
+    // Temporarily protect math functions with \x01 sentinels.
+    for (i, func) in math_funcs.iter().enumerate() {
+        result = result.replace(func, &format!("\x01MF{}\x01", i));
+    }
+    // Separate adjacent Latin letters.
+    let letter_pair = regex::Regex::new(r"([a-zA-Z])([a-zA-Z])").unwrap();
+    result = letter_pair.replace_all(&result, "$1 $2").to_string();
+    // Restore math functions.  \x01 sentinels prevent regex corruption.
+    for (i, func) in math_funcs.iter().enumerate() {
+        result = result.replace(&format!("\x01MF{}\x01", i), func);
+    }
+
     result
 }
 
@@ -1690,6 +1830,12 @@ pub fn render_cheatsheet(
         Path::new(p).extension().and_then(|e| e.to_str()) != Some("typ")
     });
 
+    // Ensure calibration data is available (lazy auto-calibrate on first use).
+    let template_path_for_cal = template_path.map(|p| Path::new(p));
+    let project_dir = out_pdf.parent().unwrap_or(Path::new("."));
+    let calibration =
+        crate::utils::calibration::ensure_calibration(template_path_for_cal, project_dir);
+
     let mut last_error: Option<String> = None;
     // Track space utilisation computed via `typst query`; used both for
     // overflow decisions and underflow reporting.
@@ -1857,8 +2003,9 @@ pub fn render_cheatsheet(
             // Compute chars/page ratio for diagnostics.
             let input_chars = working_content.chars().count();
             let chars_per_page = input_chars as f64 / page_count.max(1) as f64;
-            let fill_pct = chars_per_page / 11000.0 * 100.0;
-            let total_target = max_pages.saturating_mul(11000);
+            let per_page_ref = calibration.cjk_chars_per_page as f64;
+            let fill_pct = chars_per_page / per_page_ref * 100.0;
+            let total_target = max_pages.saturating_mul(calibration.cjk_chars_per_page);
             let total_fill_pct = input_chars as f64 / total_target.max(1) as f64 * 100.0;
             let under_util = space_utilization
                 .as_ref()
@@ -1889,9 +2036,13 @@ pub fn render_cheatsheet(
                 total_fill_pct,
                 under_util,
                 space_utilization.as_ref().map(|su| format!(
-                    "total_content={:.2} last_page={:.1}%",
+                    "total_content={:.2} last_page={:.1}% pages=[{}]",
                     su.total_content_pages,
                     su.last_page_utilization_pct,
+                    su.page_utilizations.iter()
+                        .map(|p| format!("p{}:{:.0}%", p.page, p.utilization_pct))
+                        .collect::<Vec<_>>()
+                        .join(" "),
                 )),
             ));
 
@@ -2421,7 +2572,7 @@ More text
                 element_type: "par".into(),
             },
         ];
-        let su = compute_space_utilization(&elements, 1, 1);
+        let su = compute_space_utilization_from_elements(&elements, 1, 1);
         assert!(su.overflow_ratio.is_none());
         assert!(!su.last_page_under_utilized); // 280/297 ≈ 94% > 75%
         assert!((su.last_page_utilization_pct - 94.27).abs() < 0.5);
@@ -2441,7 +2592,7 @@ More text
                 element_type: "heading".into(),
             },
         ];
-        let su = compute_space_utilization(&elements, 2, 2);
+        let su = compute_space_utilization_from_elements(&elements, 2, 2);
         assert!(su.overflow_ratio.is_none());
         assert!(su.last_page_under_utilized); // 30/297 ≈ 10% < 75%
         assert!(su.last_page_utilization_pct < 20.0);
@@ -2467,7 +2618,7 @@ More text
                 element_type: "par".into(),
             },
         ];
-        let su = compute_space_utilization(&elements, 3, 2);
+        let su = compute_space_utilization_from_elements(&elements, 3, 2);
         assert!(su.overflow_ratio.is_some());
         let ratio = su.overflow_ratio.unwrap();
         // page 1: ~97.6%, page 2: ~96.0%, page 3: 20% → total ≈ 2.136
@@ -2497,7 +2648,7 @@ More text
                 element_type: "par".into(),
             },
         ];
-        let su = compute_space_utilization(&elements, 3, 2);
+        let su = compute_space_utilization_from_elements(&elements, 3, 2);
         let ratio = su.overflow_ratio.unwrap();
         assert!(ratio > 1.25); // severe overflow — should skip layout tightening
     }
@@ -2507,22 +2658,30 @@ More text
     #[test]
     fn tighter_template_level_1_changes_gutter() {
         let result = generate_tighter_typst_template(DEFAULT_TYPST_TEMPLATE, 1);
-        assert!(!result.contains("gutter: 2mm"));
-        assert!(result.contains("gutter: 1.2mm"));
+        assert!(!result.contains("gutter: 3.2mm"));
+        assert!(result.contains("gutter: 2.2mm"));
         // Body font should shrink.
-        assert!(result.contains("size: 4.8pt"));
-        assert!(!result.contains("size: 5pt,\n  lang:"));
-        // Heading spacing should tighten.
+        assert!(result.contains("size: 6.2pt"));
+        assert!(!result.contains("size: 6.5pt,\n  lang:"));
+        // Default heading spacing should tighten.
         assert!(!result.contains("set block(above: 0.8pt, below: 0.4pt)"));
         assert!(result.contains("set block(above: 0.5pt, below: 0.2pt)"));
+        // Per-level heading spacing should tighten.
+        assert!(result.contains("set block(above: 1.5pt, below: 0.6pt)"));
+        assert!(result.contains("set block(above: 1pt, below: 0.3pt)"));
+        assert!(result.contains("set block(above: 0.6pt, below: 0.1pt)"));
     }
 
     #[test]
     fn tighter_template_level_2_changes_gutter_more() {
         let result = generate_tighter_typst_template(DEFAULT_TYPST_TEMPLATE, 2);
-        assert!(result.contains("gutter: 0.8mm"));
-        assert!(result.contains("size: 4.5pt"));
+        assert!(result.contains("gutter: 1.5mm"));
+        assert!(result.contains("size: 5.8pt"));
         assert!(result.contains("set block(above: 0.3pt, below: 0.1pt)"));
+        // Per-level heading spacing should tighten aggressively.
+        assert!(result.contains("set block(above: 0.8pt, below: 0.3pt)"));
+        assert!(result.contains("set block(above: 0.5pt, below: 0.2pt)"));
+        assert!(result.contains("set block(above: 0.3pt, below: 0pt)"));
     }
 
     #[test]

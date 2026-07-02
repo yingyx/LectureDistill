@@ -26,9 +26,10 @@ use crate::prompts::cheat_sheet::{build_cheat_sheet_turn2_prompt, build_expansio
 use crate::prompts::ref_digest::build_ref_digest_user_prompt;
 use crate::prompts::unified_pipeline::build_unified_pipeline_system_prompt;
 use crate::utils::budget::{
-    build_cheatsheet_metadata, build_section_inventory, estimate_cheating_sheet_budget,
+    build_cheatsheet_metadata, build_section_inventory, compute_budget, count_effective,
     should_attempt_expansion, CheatingSheetGenerationResult,
 };
+use crate::utils::calibration::ensure_calibration;
 use crate::utils::markdown::strip_markdown_fences;
 use crate::utils::output::{
     cheating_sheet_markdown_path, process_output_path_for, update_single_output_progress, web_log,
@@ -274,6 +275,50 @@ async fn run_cheat_pipeline_single_pass(
     };
 
     // Write digest to disk and mark Ready for each ref_digest output.
+    let digest_markdown = {
+        let source_chars = transcript_context.chars().count();
+        let (quality_ok, quality_reason) = crate::utils::budget::check_ref_digest_quality(
+            digest_markdown.chars().count(),
+            source_chars,
+            max_pages,
+        );
+        web_log(format!(
+            "job {} unified-pipeline: quality gate — {}",
+            job_id, quality_reason,
+        ));
+
+        if !quality_ok {
+            let target_min = max_pages.saturating_mul(11000).saturating_mul(60) / 100;
+            let retry_prompt = crate::prompts::ref_digest::build_ref_digest_retry_prompt(
+                &digest_markdown,
+                source_chars,
+                digest_markdown.chars().count(),
+                target_min.max(source_chars.saturating_mul(75) / 1000), // 7.5%
+            );
+            match conversation.turn(&retry_prompt, 0.25, 81920).await {
+                Ok(text) => {
+                    let retry_md = strip_markdown_fences(&text);
+                    let retry_chars = retry_md.chars().count();
+                    web_log(format!(
+                        "job {} unified-pipeline: quality retry — {} chars (was {})",
+                        job_id,
+                        retry_chars,
+                        digest_markdown.chars().count(),
+                    ));
+                    retry_md
+                }
+                Err(e) => {
+                    web_log(format!(
+                        "job {} unified-pipeline: quality retry failed: {} — using original",
+                        job_id, e,
+                    ));
+                    digest_markdown
+                }
+            }
+        } else {
+            digest_markdown
+        }
+    };
     let generated_chars = digest_markdown.chars().count();
     for output in ref_digest_outputs {
         let output_path = process_store.output_path(process_id, &output.id);
@@ -338,13 +383,16 @@ async fn run_cheat_pipeline_single_pass(
             .clamp(1, 20);
 
         let ref_digest_chars = digest_markdown.chars().count();
-        let budget = estimate_cheating_sheet_budget(output_max_pages);
-        let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
+        let calibration = ensure_calibration(None, &process_store.project_dir());
+        let effective = count_effective(&digest_markdown);
+        let budget = compute_budget(&calibration, &effective, output_max_pages);
+        let lang = budget.language;
+        let source_too_short = ref_digest_chars < budget.min_acceptable;
 
         web_log(format!(
-            "job {} unified-pipeline: output {} budget max_pages={} target={} soft_max={} ref_digest_chars={} source_too_short={}",
-            job_id, output.id, output_max_pages, budget.target_chars, budget.soft_max_chars,
-            ref_digest_chars, source_too_short,
+            "job {} unified-pipeline: output {} budget max_pages={} target={} soft_max={} ref_digest_chars={} source_too_short={} lang={:?}",
+            job_id, output.id, output_max_pages, budget.target, budget.soft_max,
+            ref_digest_chars, source_too_short, lang,
         ));
 
         // Fork conversation for this output.
@@ -368,17 +416,22 @@ async fn run_cheat_pipeline_single_pass(
             &budget,
         );
 
-        let gen_result = match fork.turn(&turn2_user, 0.2, 81920).await {
-            Ok(text) => {
+        let gen_result = match fork.turn_with_metadata(&turn2_user, 0.2, 81920).await {
+            Ok((text, finish_reason)) => {
                 let md = strip_markdown_fences(&text);
                 let chars = md.chars().count();
+                web_log(format!(
+                    "job {} unified-pipeline: Turn 2 — raw_chars={} stripped_chars={} target={} finish_reason={:?}",
+                    job_id, text.chars().count(), chars, budget.target, finish_reason,
+                ));
                 CheatingSheetGenerationResult {
                     markdown: md,
-                    target_chars: budget.target_chars,
+                    target_chars: budget.target,
                     generated_chars: chars,
                     harness_attempts: 1,
                     expansion_used: false,
                     underfilled_reason: None,
+                    language: lang,
                 }
             }
             Err(e) => {
@@ -414,7 +467,7 @@ async fn run_cheat_pipeline_single_pass(
                     &fallback_md,
                     &markdown_path,
                     output_max_pages,
-                    budget.target_chars,
+                    budget.target,
                     fallback_chars,
                     0,
                     false,
@@ -467,7 +520,7 @@ async fn run_cheat_pipeline_single_pass(
             Ok(artifact) => {
                 let decision = should_attempt_expansion(
                     gen_result.generated_chars,
-                    budget.min_acceptable_chars,
+                    budget.min_acceptable,
                     artifact.page_count,
                     output_max_pages,
                     source_too_short,
@@ -516,12 +569,24 @@ async fn run_cheat_pipeline_single_pass(
 
             for pass in 0..MAX_EXPANSION_PASSES {
                 let current_chars = current_md.chars().count();
-                let gap = budget.target_chars.saturating_sub(current_chars);
+                let gap = budget.target.saturating_sub(current_chars);
 
                 if gap == 0 {
                     web_log(format!(
                         "job {} unified-pipeline: expansion pass {} — target reached",
                         job_id, pass,
+                    ));
+                    break;
+                }
+
+                // Check for overflow: if chars/page already exceeds soft_max,
+                // stop expanding — more content would just cause truncation.
+                let chars_per_page = current_chars as f64 / last_page_count.unwrap_or(1) as f64;
+                let soft_max_per_page = budget.soft_max / output_max_pages.max(1);
+                if chars_per_page > soft_max_per_page as f64 {
+                    web_log(format!(
+                        "job {} unified-pipeline: expansion pass {} — stopping: chars/page={:.0} > soft_max_per_page={} (content likely overflowing)",
+                        job_id, pass + 1, chars_per_page, soft_max_per_page,
                     ));
                     break;
                 }
@@ -535,27 +600,28 @@ async fn run_cheat_pipeline_single_pass(
                 };
 
                 web_log(format!(
-                    "job {} unified-pipeline: expansion pass {}/{} — current={} target={} gap={} target_add={}",
-                    job_id, pass + 1, MAX_EXPANSION_PASSES, current_chars, budget.target_chars, gap, target_add,
+                    "job {} unified-pipeline: expansion pass {}/{} — current={} target={} gap={} target_add={} chars/page={:.0}",
+                    job_id, pass + 1, MAX_EXPANSION_PASSES, current_chars, budget.target, gap, target_add, chars_per_page,
                 ));
 
-                let turn3_user = build_expansion_turn3_prompt(target_add, &inventory);
-                match fork.turn(&turn3_user, 0.2, 81920).await {
-                    Ok(expanded_text) => {
+                let turn3_user = build_expansion_turn3_prompt(target_add, &inventory, lang);
+                match fork.turn_with_metadata(&turn3_user, 0.2, 81920).await {
+                    Ok((expanded_text, finish_reason)) => {
                         let raw_chars = expanded_text.chars().count();
                         let expanded_md = strip_markdown_fences(&expanded_text);
                         let expanded_chars = expanded_md.chars().count();
                         let added = expanded_chars.saturating_sub(current_chars);
 
                         web_log(format!(
-                            "job {} unified-pipeline: expansion pass {} result — raw={} stripped={} added={} target_add={}",
-                            job_id, pass + 1, raw_chars, expanded_chars, added, target_add,
+                            "job {} unified-pipeline: expansion pass {} result — raw={} stripped={} added={} target_add={} finish_reason={:?}",
+                            job_id, pass + 1, raw_chars, expanded_chars, added, target_add, finish_reason,
                         ));
 
                         if expanded_chars <= current_chars {
                             web_log(format!(
                                 "job {} unified-pipeline: expansion pass {} no growth — stopping",
-                                job_id, pass + 1,
+                                job_id,
+                                pass + 1,
                             ));
                             break;
                         }
@@ -567,7 +633,9 @@ async fn run_cheat_pipeline_single_pass(
                         if let Err(e) = fs::write(&markdown_path, &current_md) {
                             web_log(format!(
                                 "job {} unified-pipeline: write expansion pass {} failed: {}",
-                                job_id, pass + 1, e,
+                                job_id,
+                                pass + 1,
+                                e,
                             ));
                             break;
                         }
@@ -591,7 +659,9 @@ async fn run_cheat_pipeline_single_pass(
                             Err(e) => {
                                 web_log(format!(
                                     "job {} unified-pipeline: expansion pass {} render failed: {}",
-                                    job_id, pass + 1, e,
+                                    job_id,
+                                    pass + 1,
+                                    e,
                                 ));
                                 break;
                             }
@@ -600,7 +670,9 @@ async fn run_cheat_pipeline_single_pass(
                     Err(e) => {
                         web_log(format!(
                             "job {} unified-pipeline: expansion pass {} LLM failed: {}",
-                            job_id, pass + 1, e,
+                            job_id,
+                            pass + 1,
+                            e,
                         ));
                         break;
                     }
@@ -609,9 +681,9 @@ async fn run_cheat_pipeline_single_pass(
 
             // ── Fallback: extract from Reference Digest if still underfilled ──
             let final_chars = current_md.chars().count();
-            let fill_ratio = final_chars as f64 / budget.target_chars as f64;
-            if fill_ratio < MIN_FILL_RATIO && final_chars < budget.target_chars {
-                let gap = budget.target_chars.saturating_sub(final_chars);
+            let fill_ratio = final_chars as f64 / budget.target as f64;
+            if fill_ratio < MIN_FILL_RATIO && final_chars < budget.target {
+                let gap = budget.target.saturating_sub(final_chars);
                 web_log(format!(
                     "job {} unified-pipeline: fill ratio {:.1}% < {:.0}% — extracting {} chars from Ref Digest",
                     job_id, fill_ratio * 100.0, MIN_FILL_RATIO * 100.0, gap,
@@ -661,7 +733,7 @@ async fn run_cheat_pipeline_single_pass(
             if let Some(ref reason) = underfilled_reason {
                 web_log(format!(
                     "job {} unified-pipeline: expansion skipped — reason={} ref_digest_chars={} min_acceptable={}",
-                    job_id, reason, ref_digest_chars, budget.min_acceptable_chars,
+                    job_id, reason, ref_digest_chars, budget.min_acceptable,
                 ));
             }
             let mut result = gen_result;
@@ -1005,13 +1077,16 @@ async fn write_digest_and_process_cheat_sheets(
             .unwrap_or(max_pages)
             .clamp(1, 20);
 
-        let budget = estimate_cheating_sheet_budget(output_max_pages);
-        let source_too_short = ref_digest_chars < budget.min_acceptable_chars;
+        let calibration = ensure_calibration(None, &process_store.project_dir());
+        let effective = count_effective(digest_markdown);
+        let budget = compute_budget(&calibration, &effective, output_max_pages);
+        let lang = budget.language;
+        let source_too_short = ref_digest_chars < budget.min_acceptable;
 
         web_log(format!(
-            "job {} unified-pipeline (multi): output {} budget max_pages={} target={} soft_max={} ref_digest_chars={} source_too_short={}",
-            job_id, output.id, output_max_pages, budget.target_chars, budget.soft_max_chars,
-            ref_digest_chars, source_too_short,
+            "job {} unified-pipeline (multi): output {} budget max_pages={} target={} soft_max={} ref_digest_chars={} source_too_short={} lang={:?}",
+            job_id, output.id, output_max_pages, budget.target, budget.soft_max,
+            ref_digest_chars, source_too_short, lang,
         ));
 
         let mut fork = conversation.fork();
@@ -1034,17 +1109,22 @@ async fn write_digest_and_process_cheat_sheets(
             &budget,
         );
 
-        let gen_result = match fork.turn(&turn2_user, 0.2, 81920).await {
-            Ok(text) => {
+        let gen_result = match fork.turn_with_metadata(&turn2_user, 0.2, 81920).await {
+            Ok((text, finish_reason)) => {
                 let md = strip_markdown_fences(&text);
                 let chars = md.chars().count();
+                web_log(format!(
+                    "job {} unified-pipeline: Turn 2 — raw_chars={} stripped_chars={} target={} finish_reason={:?}",
+                    job_id, text.chars().count(), chars, budget.target, finish_reason,
+                ));
                 CheatingSheetGenerationResult {
                     markdown: md,
-                    target_chars: budget.target_chars,
+                    target_chars: budget.target,
                     generated_chars: chars,
                     harness_attempts: 1,
                     expansion_used: false,
                     underfilled_reason: None,
+                    language: lang,
                 }
             }
             Err(e) => {
@@ -1080,7 +1160,7 @@ async fn write_digest_and_process_cheat_sheets(
                     &fallback_md,
                     &markdown_path,
                     output_max_pages,
-                    budget.target_chars,
+                    budget.target,
                     fallback_chars,
                     0,
                     false,
@@ -1133,7 +1213,7 @@ async fn write_digest_and_process_cheat_sheets(
             Ok(artifact) => {
                 let decision = should_attempt_expansion(
                     gen_result.generated_chars,
-                    budget.min_acceptable_chars,
+                    budget.min_acceptable,
                     artifact.page_count,
                     output_max_pages,
                     source_too_short,
@@ -1164,16 +1244,20 @@ async fn write_digest_and_process_cheat_sheets(
                 "expanding content (unified)",
             );
             let current_chars = gen_result.generated_chars;
-            let target_add_chars = (budget.target_chars.saturating_sub(current_chars))
+            let target_add_chars = (budget.target.saturating_sub(current_chars))
                 .min(6000)
                 .max(2000);
 
-            let turn3_user = build_expansion_turn3_prompt(target_add_chars, &inventory);
+            let turn3_user = build_expansion_turn3_prompt(target_add_chars, &inventory, lang);
 
-            match fork.turn(&turn3_user, 0.2, 81920).await {
-                Ok(expanded_text) => {
+            match fork.turn_with_metadata(&turn3_user, 0.2, 81920).await {
+                Ok((expanded_text, finish_reason)) => {
                     let expanded_md = strip_markdown_fences(&expanded_text);
                     let expanded_chars = expanded_md.chars().count();
+                    web_log(format!(
+                        "job {} unified-pipeline (multi): expansion — raw={} stripped={} target_add={} finish_reason={:?}",
+                        job_id, expanded_text.chars().count(), expanded_chars, target_add_chars, finish_reason,
+                    ));
                     if let Err(e) = fs::write(&markdown_path, &expanded_md) {
                         web_log(format!(
                             "job {} unified-pipeline (multi): failed to write expansion: {}",

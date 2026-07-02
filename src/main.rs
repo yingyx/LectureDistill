@@ -112,6 +112,21 @@ enum Commands {
         #[command(subcommand)]
         cmd: ProcessCmd,
     },
+    /// Calibrate budget constants for a Typst template
+    Calibrate {
+        /// Path to Typst template file (uses embedded default if omitted)
+        #[arg(long = "template")]
+        template: Option<PathBuf>,
+        /// Force re-calibration even if cached data exists
+        #[arg(long = "force")]
+        force: bool,
+        /// Project directory for calibration cache
+        #[arg(
+            long = "project-dir",
+            default_value = ".lecture-distill/projects/default"
+        )]
+        project_dir: PathBuf,
+    },
     /// Start the local Web GUI
     Gui {
         /// Host to bind the web server
@@ -149,6 +164,9 @@ enum ProcessCmd {
         /// Re-run an existing process by ID (uses its saved source_ids and outputs)
         #[arg(long = "process-id")]
         process_id: Option<String>,
+        /// Comma-separated source IDs to process (default: all sources)
+        #[arg(long = "source-ids")]
+        source_ids: Option<String>,
     },
 }
 
@@ -261,10 +279,26 @@ async fn main() -> Result<()> {
                 outputs,
                 debug,
                 process_id,
+                source_ids,
             } => {
-                cmd_process_run(&project_dir, outputs.as_deref(), debug, process_id.as_deref()).await?;
+                cmd_process_run(
+                    &project_dir,
+                    outputs.as_deref(),
+                    debug,
+                    process_id.as_deref(),
+                    source_ids.as_deref(),
+                )
+                .await?;
             }
         },
+
+        Commands::Calibrate {
+            template,
+            force,
+            project_dir,
+        } => {
+            cmd_calibrate(template.as_deref(), force, &project_dir)?;
+        }
 
         Commands::Gui {
             host,
@@ -506,6 +540,7 @@ async fn cmd_process_run(
     outputs: Option<&str>,
     debug: bool,
     process_id_override: Option<&str>,
+    source_ids_filter: Option<&str>,
 ) -> Result<()> {
     use std::sync::Arc;
     use utils::output::{
@@ -536,9 +571,7 @@ async fn cmd_process_run(
         let config_path = std::path::Path::new(&project_dir_str).join("config.json");
         if config_path.exists() {
             if let Ok(config_json) = std::fs::read_to_string(&config_path) {
-                if let Ok(config) =
-                    serde_json::from_str::<serde_json::Value>(&config_json)
-                {
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_json) {
                     if let Some(tp) = config.get("typst_path").and_then(|v| v.as_str()) {
                         if !tp.trim().is_empty() {
                             std::env::set_var("LECTURE_DISTILL_TYPST_PATH", tp.trim());
@@ -547,6 +580,18 @@ async fn cmd_process_run(
                     }
                 }
             }
+        }
+    }
+
+    // Load secrets (API keys) from secrets.local.json — mirrors GUI path.
+    {
+        let secret_store = crate::web::secrets::SecretStore::new(&project_dir_str);
+        let secrets = secret_store.load();
+        secrets.apply_to_env();
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            println!("[secrets] LLM API key loaded from secrets.local.json");
+        } else {
+            println!("[secrets] No API key found — LLM features may be unavailable");
         }
     }
 
@@ -637,7 +682,35 @@ async fn cmd_process_run(
     }
 
     // Collect all source IDs (CLI processes all sources in the project).
-    let source_ids: Vec<String> = sources.iter().map(|s| s.id.clone()).collect();
+    let mut source_ids: Vec<String> = sources.iter().map(|s| s.id.clone()).collect();
+
+    // Apply source filter if provided.
+    if let Some(filter_str) = source_ids_filter {
+        let filter_set: std::collections::HashSet<&str> = filter_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !filter_set.is_empty() {
+            let before = source_ids.len();
+            source_ids.retain(|id| filter_set.contains(id.as_str()));
+            println!(
+                "Source filter: {} of {} sources selected",
+                source_ids.len(),
+                before
+            );
+            if source_ids.is_empty() {
+                anyhow::bail!(
+                    "No sources matched the filter. Available source IDs:\n{}",
+                    sources
+                        .iter()
+                        .map(|s| format!("  {} — {}", s.id, s.title))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
+    }
 
     println!("Project: {}", project_dir.display());
     println!("Sources: {} source(s)", source_ids.len());
@@ -686,7 +759,11 @@ async fn cmd_process_run(
     println!("Outputs requested:");
     for (kind, max_pages) in &expanded {
         if *max_pages > 0 {
-            println!("  - {} (max_pages: {})", process_output_title(kind), max_pages);
+            println!(
+                "  - {} (max_pages: {})",
+                process_output_title(kind),
+                max_pages
+            );
         } else {
             println!("  - {}", process_output_title(kind));
         }
@@ -701,8 +778,7 @@ async fn cmd_process_run(
     let mut outputs_vec: Vec<ProcessOutput> = Vec::new();
     for (kind, max_pages) in &expanded {
         let output_id = uuid::Uuid::new_v4().to_string();
-        let output_path =
-            process_output_path_for(&process_store, &process_id, &output_id, kind);
+        let output_path = process_output_path_for(&process_store, &process_id, &output_id, kind);
         let diff_path = if *kind == ProcessOutputKind::NotePatch {
             Some(process_store.diff_path(&process_id, &output_id))
         } else {
@@ -713,8 +789,7 @@ async fn cmd_process_run(
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let markdown_path =
-            cheating_sheet_markdown_path(&process_store, &process_id, &output_id);
+        let markdown_path = cheating_sheet_markdown_path(&process_store, &process_id, &output_id);
 
         let metadata = if *kind == ProcessOutputKind::ReferenceDigest {
             serde_json::json!({
@@ -806,12 +881,7 @@ fn print_process_results(
             ProcessRecordStatus::Failed => "✗",
             ProcessRecordStatus::Processing => "…",
         };
-        println!(
-            "  [{}] {} ({})",
-            status_icon,
-            output.title,
-            output.status
-        );
+        println!("  [{}] {} ({})", status_icon, output.title, output.status);
         println!("       Path: {}", output.path);
 
         if output.status == ProcessRecordStatus::Failed {
@@ -826,34 +896,126 @@ fn print_process_results(
                 println!("       Size: {} bytes", meta.len());
             }
 
+            // Show generated chars from metadata.
+            if let Some(generated) = output
+                .metadata
+                .get("generated_chars")
+                .and_then(|v| v.as_u64())
+            {
+                print!("       Generated chars: {}", generated);
+                if let Some(target) = output.metadata.get("target_chars").and_then(|v| v.as_u64()) {
+                    let pct = if target > 0 {
+                        (generated as f64 / target as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(" / {} ({:.0}%)", target, pct);
+                } else {
+                    println!();
+                }
+            }
+
             // For CheatSheet, read the rendered artifact for diagnostics.
             if output.kind == ProcessOutputKind::CheatingSheet {
-                let markdown_path = output
-                    .metadata
-                    .get("markdown_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !markdown_path.is_empty() {
-                    if let Ok(md_content) = std::fs::read_to_string(markdown_path) {
-                        let char_count = md_content.chars().count();
-                        println!("       Cheat Sheet markdown: {} chars", char_count);
-                    }
+                if let Some(fill) = output.metadata.get("fill_pct").and_then(|v| v.as_str()) {
+                    println!("       Typst last page fill: {}%", fill);
                 }
             }
         }
 
         if debug && output.status == ProcessRecordStatus::Ready {
-            // Print metadata for diagnostics.
-            if let Some(max_pages) = output
-                .metadata
-                .get("max_pages")
-                .and_then(|v| v.as_u64())
-            {
-                println!("       Max pages: {}", max_pages);
+            // ── Enhanced diagnostics ──
+
+            // Char budget analysis
+            if let Some(target) = output.metadata.get("target_chars").and_then(|v| v.as_u64()) {
+                let generated = output
+                    .metadata
+                    .get("generated_chars")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let gap_pct = if target > 0 {
+                    (generated as f64 / target as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let status = if gap_pct >= 90.0 {
+                    "OK"
+                } else if gap_pct >= 70.0 {
+                    "LOW"
+                } else {
+                    "CRITICAL"
+                };
+                println!(
+                    "       Char budget: {}/{} ({:.0}%) [{}]",
+                    generated, target, gap_pct, status
+                );
             }
 
-            // For CheatSheet outputs, read markdown for char count and
-            // attempt to extract space_utilization from any saved artifact.
+            // Typst fill and utilization
+            if let Some(fill) = output.metadata.get("fill_pct").and_then(|v| v.as_str()) {
+                println!("       Typst last page fill: {}%", fill);
+            }
+            if let Some(total_pages) = output
+                .metadata
+                .get("total_content_pages")
+                .and_then(|v| v.as_str())
+            {
+                println!("       Total content pages: {}", total_pages);
+            }
+
+            // Expansion diagnostics
+            if let Some(expanded) = output
+                .metadata
+                .get("expansion_used")
+                .and_then(|v| v.as_bool())
+            {
+                println!("       Expansion used: {}", expanded);
+            }
+            if let Some(reason) = output
+                .metadata
+                .get("underfilled_reason")
+                .and_then(|v| v.as_str())
+            {
+                println!("       Underfilled reason: {}", reason);
+            }
+            if let Some(harness) = output
+                .metadata
+                .get("harness_attempts")
+                .and_then(|v| v.as_u64())
+            {
+                println!("       LLM harness attempts: {}", harness);
+            }
+
+            // Per-page utilization breakdown
+            if let Some(pages) = output
+                .metadata
+                .get("page_utilizations")
+                .and_then(|v| v.as_array())
+            {
+                if !pages.is_empty() {
+                    println!("       Per-page utilization:");
+                    for p in pages {
+                        if let (Some(page), Some(util)) = (
+                            p.get("page").and_then(|v| v.as_u64()),
+                            p.get("utilization_pct").and_then(|v| v.as_str()),
+                        ) {
+                            let pct: f64 = util.parse().unwrap_or(0.0);
+                            let bar = if pct >= 80.0 {
+                                "████"
+                            } else if pct >= 60.0 {
+                                "███░"
+                            } else if pct >= 40.0 {
+                                "██░░"
+                            } else {
+                                "█░░░"
+                            };
+                            println!("         page {}: {}% {}", page, util, bar);
+                        }
+                    }
+                }
+            }
+
+            // For CheatSheet outputs, read markdown for char count.
             if output.kind == ProcessOutputKind::CheatingSheet {
                 let markdown_path = output
                     .metadata
@@ -865,24 +1027,33 @@ fn print_process_results(
                         let char_count = md_content.chars().count();
                         // Count PDF page count if possible.
                         if let Ok(pdf_bytes) = std::fs::read(&output.path) {
-                            // Minimal PDF page count: count "/Type /Page" occurrences.
-                            // This is a rough heuristic; for accurate counts use a PDF library.
                             let pdf_text = String::from_utf8_lossy(&pdf_bytes);
                             let page_count = pdf_text.matches("/Type /Page").count()
                                 + pdf_text.matches("/Type/Page").count();
-                            let page_count = if page_count == 0 {
-                                1usize
-                            } else {
-                                page_count
-                            };
+                            let page_count = if page_count == 0 { 1usize } else { page_count };
                             let chars_per_page = char_count as f64 / page_count as f64;
                             println!(
-                                "       Generated chars: {}, Page count: {}, Chars/page: {:.0}",
+                                "       PDF: {} chars, {} pages, {:.0} chars/page",
                                 char_count, page_count, chars_per_page
                             );
                         }
                     }
                 }
+            }
+
+            // Ref Digest diagnostics
+            if output.kind == ProcessOutputKind::ReferenceDigest {
+                if let Some(generated) = output
+                    .metadata
+                    .get("generated_chars")
+                    .and_then(|v| v.as_u64())
+                {
+                    println!("       Ref Digest chars: {}", generated);
+                }
+            }
+
+            if let Some(max_pages) = output.metadata.get("max_pages").and_then(|v| v.as_u64()) {
+                println!("       Max pages: {}", max_pages);
             }
         }
 
@@ -890,7 +1061,54 @@ fn print_process_results(
     }
 
     println!("Process ID: {}", process_id);
-    println!("Artifacts directory: {}/artifacts/processes/{}", project_dir_str, process_id);
+    println!(
+        "Artifacts directory: {}/artifacts/processes/{}",
+        project_dir_str, process_id
+    );
+}
+
+/// `calibrate` - run template calibration.
+fn cmd_calibrate(
+    template: Option<&std::path::Path>,
+    force: bool,
+    project_dir: &PathBuf,
+) -> Result<()> {
+    if force {
+        // Remove existing calibration file to force re-run.
+        match template {
+            Some(tp) => {
+                let mut cal_path = tp.to_path_buf();
+                cal_path.set_extension("calibration.json");
+                if cal_path.exists() {
+                    std::fs::remove_file(&cal_path)?;
+                    println!("Removed existing calibration: {}", cal_path.display());
+                }
+            }
+            None => {
+                let def_cal = project_dir
+                    .join("calibrations")
+                    .join("__default__.calibration.json");
+                if def_cal.exists() {
+                    std::fs::remove_file(&def_cal)?;
+                    println!("Removed existing calibration: {}", def_cal.display());
+                }
+            }
+        }
+    }
+
+    let calib = lecture_distill::utils::calibration::ensure_calibration(template, project_dir);
+
+    println!("Template: {}", calib.template);
+    println!("Calibrated at: {}", calib.calibrated_at);
+    println!("CJK chars/page: {}", calib.cjk_chars_per_page);
+    println!("English words/page: {}", calib.english_words_per_page);
+    println!("English chars/page: {}", calib.english_chars_per_page);
+    println!(
+        "Page dimensions: {:.1}mm x {:.1}mm",
+        calib.page_width_mm, calib.page_height_mm
+    );
+
+    Ok(())
 }
 
 /// `gui` - start the local Web GUI.

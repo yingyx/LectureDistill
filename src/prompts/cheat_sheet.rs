@@ -4,9 +4,10 @@
 //! and unified pipeline stages), expansion prompts, and metadata construction.
 
 use crate::utils::budget::{
-    build_section_inventory, estimate_cheating_sheet_budget, truncate_ref_digest_for_cheatsheet,
-    CheatingSheetBudget,
+    build_section_inventory, compute_budget, count_effective, format_target,
+    truncate_ref_digest_for_cheatsheet, ContentBudget, Language,
 };
+use crate::utils::calibration::CalibrationData;
 
 /// Build the Turn 2 user prompt: compress the Reference Digest into a cheat sheet.
 ///
@@ -17,12 +18,13 @@ pub(crate) fn build_cheat_sheet_turn2_prompt(
     section_names: &str,
     section_count: usize,
     max_pages: usize,
-    budget: &CheatingSheetBudget,
+    budget: &ContentBudget,
 ) -> String {
+    let target_text = format_target(budget);
     format!(
         "STAGE 2 — CHEAT SHEET.\n\n\
          Target: a {} page(s) exam cheat sheet.\n\
-         Roughly {} characters typically fills {} page(s); up to {} is fine — \
+         {}. Up to roughly {} is acceptable — \
          the renderer will compress if needed.\n\n\
          Coverage requirement: the Reference Digest has {} main sections in order: {}\n\
          Every main section MUST contribute at least one of: definition, formula, \
@@ -30,16 +32,14 @@ pub(crate) fn build_cheat_sheet_turn2_prompt(
          Section inventory:\n{}\n\n\
          Do not invent new facts.  Extract and organize the essential content from \
          the Reference Digest you created above.  Prefer completeness over conciseness.\n\n\
-         Return only the complete cheating-sheet Markdown.  Aim for roughly {} \
-         characters; more is acceptable.",
+         Return only the complete cheating-sheet Markdown.  Aim for {}; more is acceptable.",
         max_pages,
-        budget.target_chars,
-        max_pages,
-        budget.soft_max_chars,
+        target_text,
+        budget.soft_max,
         section_count,
         section_names,
         inventory,
-        budget.target_chars,
+        target_text,
     )
 }
 
@@ -47,12 +47,20 @@ pub(crate) fn build_cheat_sheet_turn2_prompt(
 ///
 /// Both the Reference Digest and the Cheat Sheet are already in the
 /// conversation history — no excerpt or repetition needed.
-pub(crate) fn build_expansion_turn3_prompt(target_add_chars: usize, inventory: &str) -> String {
+pub(crate) fn build_expansion_turn3_prompt(
+    target_add_chars: usize,
+    inventory: &str,
+    lang: Language,
+) -> String {
+    let unit = match lang {
+        Language::Chinese => format!("{} 字", target_add_chars),
+        Language::English => format!("{} words", target_add_chars / 5),
+    };
     format!(
         "STAGE 3 — EXPANSION.\n\n\
          The cheat sheet you just created should be expanded with missing \
          high-value content from the Reference Digest you created earlier.  \
-         Add approximately {} more characters of high-value material.  \
+         Add approximately {} of high-value material.  \
          Maintain the exact same heading hierarchy and document structure.\n\n\
          Section inventory (all sections must remain covered):\n{}\n\n\
          Add the most exam-critical missing material: definitions, formulas, \
@@ -60,24 +68,31 @@ pub(crate) fn build_expansion_turn3_prompt(target_add_chars: usize, inventory: &
          rules.  Do NOT add narrative, examples without reusable patterns, \
          or anything already covered.\n\n\
          Return the complete expanded cheat-sheet Markdown.",
-        target_add_chars, inventory
+        unit, inventory
     )
 }
 
 /// Build standalone cheat sheet prompts (used by both streaming and
 /// non-streaming paths).
 ///
+/// Now accepts calibration data for language-aware targeting.
+///
 /// Returns `(system_prompt, user_prompt)`.
 pub(crate) fn build_cheat_sheet_prompts(
     ref_digest_markdown: &str,
     max_pages: usize,
+    calib: &CalibrationData,
 ) -> (String, String) {
-    let budget = estimate_cheating_sheet_budget(max_pages);
+    let effective = count_effective(ref_digest_markdown);
+    let budget = compute_budget(calib, &effective, max_pages);
+
     let (sections, inventory) = build_section_inventory(ref_digest_markdown);
 
     let section_count = sections.len();
     let section_list: Vec<String> = sections.iter().map(|s| s.heading.clone()).collect();
     let section_names = section_list.join(" | ");
+
+    let target_text = format_target(&budget);
 
     let system_prompt = "You convert a Reference Digest into an exam reference cheat-sheet Markdown \
 for a fixed LaTeX template. Cover every topic comprehensively: for each section, include its essential \
@@ -86,7 +101,7 @@ It is better to include slightly too much content than too little — the render
 needed. Do not omit topics.\n\
 Return ONLY Markdown, with no code fences, no explanations, and no raw LaTeX commands except ordinary \
 math delimited by $...$ or $$...$$. \
-The Markdown will be escaped and inserted into a XeLaTeX/xeCJK four-column A4 template, so avoid \
+The Markdown will be escaped and inserted into a XeLaTeX/xeCJK A4 template, so avoid \
 syntax that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, nested tables, \
 Mermaid, TikZ, custom macros, \\begin blocks, or unbalanced braces. \
 Use Chinese for Chinese source material, keep standard English technical terms, identifiers, and formulas. \
@@ -99,8 +114,7 @@ when possible.";
 
     let user_prompt = format!(
         "Target: a {} page(s) exam cheat sheet.\n\
-Roughly {} characters typically fills {} page(s); up to {} is fine — the renderer will \
-compress if needed.\n\n\
+{}. Up to roughly {} is acceptable — the renderer will compress if needed.\n\n\
 Coverage requirement: the Reference Digest has {} main sections in order: {}\n\
 Every main section MUST contribute at least one of: definition, formula, condition, algorithm step, \
 pitfall, comparison, or exam judgement rule.\n\n\
@@ -108,16 +122,15 @@ Do not invent new facts. Extract and organize the essential content from the Ref
 Prefer completeness over conciseness.\n\n\
 Section inventory:\n{}\n\n\
 Reference Digest Markdown:\n\n{}\n\n\
-Return only the complete cheating-sheet Markdown. Aim for roughly {} characters; more is acceptable.",
+Return only the complete cheating-sheet Markdown. Aim for {}; more is acceptable.",
         max_pages,
-        budget.target_chars,
-        max_pages,
-        budget.soft_max_chars,
+        target_text,
+        budget.soft_max,
         section_count,
         section_names,
         inventory,
         truncate_ref_digest_for_cheatsheet(ref_digest_markdown, 90000).0,
-        budget.target_chars,
+        target_text,
     );
 
     (system_prompt.to_string(), user_prompt)
@@ -131,7 +144,13 @@ pub(crate) fn build_expansion_prompt(
     section_inventory: &str,
     ref_digest_excerpt: &str,
     target_add_chars: usize,
+    lang: Language,
 ) -> (String, String) {
+    let unit = match lang {
+        Language::Chinese => format!("{} 字", target_add_chars),
+        Language::English => format!("{} words", target_add_chars / 5),
+    };
+
     let system_prompt = "You expand an existing exam cheat-sheet Markdown by adding high-value material \
 from the Reference Digest. Preserve the existing structure, headings, and content exactly as-is. \
 Only add new material where it fits naturally: definitions, formulas, conditions, algorithm steps, \
@@ -149,7 +168,7 @@ and standard Markdown math.";
     let user_prompt = format!(
         "The existing cheat sheet below should be expanded with missing high-value content \
 from the Reference Digest. \
-Add approximately {} more characters of high-value material. \
+Add approximately {} of high-value material. \
 Maintain the exact same heading hierarchy and document structure.\n\n\
 Section inventory (all sections must remain covered):\n{}\n\n\
 Existing cheat sheet:\n{}\n\n\
@@ -158,7 +177,7 @@ Add the most exam-critical missing material: definitions, formulas, conditions, 
 algorithm steps, comparisons, and judgement rules. Do NOT add narrative, examples without \
 reusable patterns, or anything already covered. \
 Return the complete expanded cheat-sheet Markdown.",
-        target_add_chars, section_inventory, current_cheat, ref_digest_excerpt
+        unit, section_inventory, current_cheat, ref_digest_excerpt
     );
 
     (system_prompt.to_string(), user_prompt)
@@ -175,10 +194,12 @@ mod tests {
             "# Cheat\n  body: content\n",
             "# RD\n\nrd content",
             500,
+            Language::Chinese,
         );
         assert!(sys.contains("expand"));
         assert!(user.contains("# Cheat"));
-        assert!(user.contains("500"));
+        // Chinese: "500 字"
+        assert!(user.contains("500 字"));
     }
 
     #[test]
@@ -188,6 +209,7 @@ mod tests {
             "# Alpha\n  body: a\n# Beta\n  body: b\n",
             "# RD",
             200,
+            Language::Chinese,
         );
         assert!(user.contains("Alpha"));
         assert!(user.contains("Beta"));
@@ -195,13 +217,16 @@ mod tests {
 
     #[test]
     fn test_expansion_prompt_contains_target_add_chars() {
-        let (_, user) = build_expansion_prompt("# CS", "# H\n  body: x\n", "# RD", 1234);
-        assert!(user.contains("1234"));
+        let (_, user) =
+            build_expansion_prompt("# CS", "# H\n  body: x\n", "# RD", 1234, Language::Chinese);
+        // Chinese: "1234 字"
+        assert!(user.contains("1234 字"));
     }
 
     #[test]
     fn test_expansion_prompt_contains_latex_safety_constraints() {
-        let (sys, _) = build_expansion_prompt("# CS", "# H\n  body: x\n", "# RD", 100);
+        let (sys, _) =
+            build_expansion_prompt("# CS", "# H\n  body: x\n", "# RD", 100, Language::Chinese);
         assert!(sys.contains("XeLaTeX"));
         assert!(sys.contains("unbalanced braces"));
         // LaTeX safety: the system prompt should mention LaTeX and brace safety.

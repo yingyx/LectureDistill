@@ -106,18 +106,18 @@ pub fn expand_output_kinds(
     }
 
     let mut kinds = Vec::new();
-    if has_note_patch || has_reference_digest || has_cheating_sheet {
-        if has_note_patch {
-            kinds.push((ProcessOutputKind::NotePatch, 2));
-        }
+    if has_note_patch {
+        kinds.push((ProcessOutputKind::NotePatch, 2));
+    }
+    if has_reference_digest {
+        kinds.push((ProcessOutputKind::ReferenceDigest, 0));
     }
     if has_cheating_sheet {
         if !has_reference_digest {
+            // Auto-add Reference Digest as dependency for Cheat Sheet.
             kinds.push((ProcessOutputKind::ReferenceDigest, 0));
         }
         kinds.push((ProcessOutputKind::CheatingSheet, cheating_sheet_pages));
-    } else if has_reference_digest {
-        kinds.push((ProcessOutputKind::ReferenceDigest, 0));
     }
     Ok(kinds)
 }

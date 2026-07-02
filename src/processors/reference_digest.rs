@@ -248,6 +248,57 @@ pub(crate) async fn run_reference_digest_outputs(
         }
     };
 
+    // --- Ref Digest Quality Gate ---
+    let source_chars = context.chars().count();
+    let max_pages_for_quality = 2; // default for quality check
+    let (quality_ok, quality_reason) = crate::utils::budget::check_ref_digest_quality(
+        digest_markdown.chars().count(),
+        source_chars,
+        max_pages_for_quality,
+    );
+    web_log(format!(
+        "job {} reference-digest: quality gate — {}",
+        job_id, quality_reason,
+    ));
+
+    let digest_markdown = if !quality_ok {
+        // Retry with corrective prompt.
+        let target_min = max_pages_for_quality
+            .saturating_mul(11000)
+            .saturating_mul(60)
+            / 100;
+        let retry_prompt = crate::prompts::ref_digest::build_ref_digest_retry_prompt(
+            &digest_markdown,
+            source_chars,
+            digest_markdown.chars().count(),
+            target_min.max(source_chars.saturating_mul(75) / 1000), // 7.5%
+        );
+        let system = crate::prompts::ref_digest::build_ref_digest_system_prompt();
+        match llm::chat_text(&system, &retry_prompt, 0.25, 81920).await {
+            Ok(text) => {
+                let retry_md = strip_markdown_fences(&text);
+                let retry_chars = retry_md.chars().count();
+                web_log(format!(
+                    "job {} reference-digest: quality retry — {} chars (was {})",
+                    job_id,
+                    retry_chars,
+                    digest_markdown.chars().count(),
+                ));
+                retry_md
+            }
+            Err(e) => {
+                web_log(format!(
+                    "job {} reference-digest: quality retry failed: {} — using original",
+                    job_id, e,
+                ));
+                digest_markdown
+            }
+        }
+    } else {
+        digest_markdown
+    };
+    // --- End Quality Gate ---
+
     // Write output for each record.
     let source_counts = serde_json::json!({
         "note": note_source.is_some(),
