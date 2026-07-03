@@ -92,48 +92,95 @@ pub const DEFAULT_TYPST_TEMPLATE: &str = r##"#set page(
   paper: "a4",
   margin: (left: 4mm, right: 4mm, top: 2mm, bottom: 3mm),
 )
+
+#let cheat-section-bg = rgb("#222222")
+#let cheat-subsec-bg = rgb("#E5E5E5")
+#let cheat-accent = rgb("#005A9E")
+#let cheat-text = rgb("#111111")
+#let cheat-box-bg = rgb("#F7F7F7")
+#let cheat-box-frame = rgb("#666666")
+
 #set text(
-  font: ("Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Arial", "New Computer Modern"),
-  size: 6.5pt,
+  font: (
+    "Segoe UI",
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "Arial",
+    "New Computer Modern",
+  ),
+  size: 6.6pt,
   lang: "zh",
+  fill: cheat-text,
+  top-edge: "bounds",
+  bottom-edge: "bounds",
 )
 #set par(
-  leading: 0.5pt,
-  spacing: 0.5pt,
+  leading: 3.0pt,
+  spacing: 1.2pt,
   first-line-indent: 0pt,
   justify: false,
 )
 
-// Default heading spacing — overridden per-level below
+// Default heading spacing - overridden per-level below.
 #show heading: set block(above: 0.8pt, below: 0.4pt)
 
-// Section (## / h1): dark background, white text
+// Section (## / h1): dark background, white text.
 #show heading.where(level: 1): it => {
-  set block(above: 2.2pt, below: 1pt)
-  set text(fill: white, size: 7.5pt, weight: "bold")
-  box(fill: rgb("#222222"), width: 100%, outset: (y: 1pt, x: 1.5pt), it.body)
+  set block(above: 3pt, below: 2pt)
+  set text(font: ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"), fill: white, size: 8pt, weight: "bold")
+  box(fill: cheat-section-bg, width: 100%, outset: (y: 1pt, x: 1.5pt), inset: (x: 1.4pt, y: 0.8pt), it.body)
 }
 
-// Subsection (### / h2): light gray background, blue accent bar
+// Subsection (### / h2): light gray background, blue accent bar.
 #show heading.where(level: 2): it => {
-  set block(above: 1.5pt, below: 0.5pt)
-  set text(fill: black, size: 6.8pt, weight: "bold")
-  box(fill: rgb("#E5E5E5"), width: 100%, outset: (y: 0.8pt, x: 1.5pt))[
-    #rect(width: 0.7mm, height: 1.6mm, fill: rgb("#005A9E"))
-    #h(0.6mm)
-    #it.body
+  set block(above: 2.2pt, below: 1.6pt)
+  set text(font: ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"), fill: black, size: 7.2pt, weight: "bold")
+  box(fill: cheat-subsec-bg, width: 100%, outset: (y: 0.8pt, x: 1.5pt), inset: (x: 1.2pt, y: 0.8pt))[
+    #grid(
+      columns: (0.7mm, 1fr),
+      gutter: 0.7mm,
+      align: horizon,
+      rect(width: 0.7mm, height: 1em, fill: cheat-accent),
+      it.body,
+    )
   ]
 }
 
-// Subsubsection (#### / h3): blue text, run-in style
+// Subsubsection (#### / h3): compact blue text.
 #show heading.where(level: 3): it => {
-  set block(above: 1pt, below: 0.2pt)
-  set text(fill: rgb("#005A9E"), size: 6.3pt, weight: "bold")
+  set block(above: 2pt, below: 2.2pt)
+  set text(font: ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"), fill: cheat-accent, size: 6.9pt, weight: "bold")
   it
 }
 
-#show list: set block(spacing: 0pt)
-#show enum: set block(spacing: 0pt)
+#set list(spacing: 2.2pt, indent: 1.1em, body-indent: 0.65em, marker: ([•]))
+#set enum(spacing: 2.2pt, indent: 1.35em, body-indent: 0.75em, numbering: "1.")
+#show list: set block(above: 1pt, below: 1pt, spacing: 1pt)
+#show enum: set block(above: 1pt, below: 1pt, spacing: 1pt)
+#show math.equation: set block(above: 3.2pt, below: 3.2pt)
+#show table: set text(size: 6.6pt)
+#show raw: set text(size: 6.5pt)
+
+#let key(body) = text(fill: cheat-accent, weight: "bold", body)
+#let term(body) = text(font: ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"), weight: "bold", body)
+#let cheatimp = $=>$
+#let cheatiff = $<=>$
+#let cheatsep = block(above: 1pt, below: 1pt)[#line(length: 100%, stroke: 0.25pt + cheat-box-frame)]
+#let cheatfact(title, body) = block(above: 2pt, below: 2pt)[
+  #rect(
+    width: 100%,
+    stroke: 0.3pt + cheat-box-frame,
+    radius: 1pt,
+    inset: 2.4pt,
+    fill: cheat-box-bg,
+  )[
+    #block(fill: cheat-section-bg, width: 100%, inset: (x: 1.5pt, y: 1.2pt))[
+      #text(font: ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"), size: 7pt, weight: "bold", fill: white, title)
+    ]
+    #v(1.2pt)
+    #body
+  ]
+]
 
 #columns(3, gutter: 3.2mm)[
 {{content}}
@@ -145,8 +192,7 @@ pub const DEFAULT_TYPST_TEMPLATE: &str = r##"#set page(
     "end_page": here().page(),
     "end_y_pt": here().position().y.pt(),
   ))
-]
-"##;
+]"##;
 
 // ---------------------------------------------------------------------------
 // Compiler discovery
@@ -834,8 +880,8 @@ fn try_compute_space_utilization(
 /// Only called when using the embedded [`DEFAULT_TYPST_TEMPLATE`]; custom user
 /// templates are never modified.
 ///
-/// * `level` 1 — mild tightening (gutter 2.2mm, body 6.2pt, tighter heading spacing)
-/// * `level` 2 — aggressive tightening (gutter 1.5mm, body 5.8pt, very tight headings)
+/// * `level` 1 - mild tightening (gutter 2.2mm, body 6.3pt, tighter heading spacing)
+/// * `level` 2 - aggressive tightening (gutter 1.5mm, body 6.0pt, very tight headings)
 fn generate_tighter_typst_template(base: &str, level: usize) -> String {
     let mut result = base.to_string();
 
@@ -843,53 +889,53 @@ fn generate_tighter_typst_template(base: &str, level: usize) -> String {
         1 => {
             // Mild: gutter 3.2mm -> 2.2mm
             result = result.replace("gutter: 3.2mm", "gutter: 2.2mm");
-            // Body text: size: 6.5pt -> 6.2pt
-            result = result.replace("size: 6.5pt,\n  lang:", "size: 6.2pt,\n  lang:");
+            // Body text: size: 6.6pt -> 6.3pt
+            result = result.replace("size: 6.6pt,\n  lang:", "size: 6.3pt,\n  lang:");
             // Default heading block: above: 0.8pt, below: 0.4pt -> 0.5pt, 0.2pt
             result = result.replace(
                 "set block(above: 0.8pt, below: 0.4pt)",
                 "set block(above: 0.5pt, below: 0.2pt)",
             );
-            // h1 block: above: 2.2pt, below: 1pt -> 1.5pt, 0.6pt
+            // h2 block: above: 2.2pt, below: 1.6pt -> 1.3pt, 0.7pt
             result = result.replace(
-                "set block(above: 2.2pt, below: 1pt)",
-                "set block(above: 1.5pt, below: 0.6pt)",
+                "set block(above: 2.2pt, below: 1.6pt)",
+                "set block(above: 1.3pt, below: 0.7pt)",
             );
-            // h2 block: above: 1.5pt, below: 0.5pt -> 1pt, 0.3pt
+            // h1 block: above: 3pt, below: 2pt -> 2pt, 1pt
             result = result.replace(
-                "set block(above: 1.5pt, below: 0.5pt)",
-                "set block(above: 1pt, below: 0.3pt)",
+                "set block(above: 3pt, below: 2pt)",
+                "set block(above: 2pt, below: 1pt)",
             );
-            // h3 block: above: 1pt, below: 0.2pt -> 0.6pt, 0.1pt
+            // h3 block: above: 2pt, below: 2.2pt -> 1pt, 0.9pt
             result = result.replace(
-                "set block(above: 1pt, below: 0.2pt)",
-                "set block(above: 0.6pt, below: 0.1pt)",
+                "set block(above: 2pt, below: 2.2pt)",
+                "set block(above: 1pt, below: 0.9pt)",
             );
         }
         2 => {
             // Aggressive: gutter 3.2mm -> 1.5mm
             result = result.replace("gutter: 3.2mm", "gutter: 1.5mm");
-            // Body text: size: 6.5pt -> 5.8pt
-            result = result.replace("size: 6.5pt,\n  lang:", "size: 5.8pt,\n  lang:");
+            // Body text: size: 6.6pt -> 6.0pt
+            result = result.replace("size: 6.6pt,\n  lang:", "size: 6.0pt,\n  lang:");
             // Default heading block: above: 0.8pt, below: 0.4pt -> 0.3pt, 0.1pt
             result = result.replace(
                 "set block(above: 0.8pt, below: 0.4pt)",
                 "set block(above: 0.3pt, below: 0.1pt)",
             );
-            // h1 block: above: 2.2pt, below: 1pt -> 0.8pt, 0.3pt
+            // h1 block: above: 3pt, below: 2pt -> 1.2pt, 0.6pt
             result = result.replace(
-                "set block(above: 2.2pt, below: 1pt)",
-                "set block(above: 0.8pt, below: 0.3pt)",
+                "set block(above: 3pt, below: 2pt)",
+                "set block(above: 1.2pt, below: 0.6pt)",
             );
-            // h2 block: above: 1.5pt, below: 0.5pt -> 0.5pt, 0.2pt
+            // h2 block: above: 2.2pt, below: 1.6pt -> 0.8pt, 0.5pt
             result = result.replace(
-                "set block(above: 1.5pt, below: 0.5pt)",
-                "set block(above: 0.5pt, below: 0.2pt)",
+                "set block(above: 2.2pt, below: 1.6pt)",
+                "set block(above: 0.8pt, below: 0.5pt)",
             );
-            // h3 block: above: 1pt, below: 0.2pt -> 0.3pt, 0pt
+            // h3 block: above: 2pt, below: 2.2pt -> 0.5pt, 0.5pt
             result = result.replace(
-                "set block(above: 1pt, below: 0.2pt)",
-                "set block(above: 0.3pt, below: 0pt)",
+                "set block(above: 2pt, below: 2.2pt)",
+                "set block(above: 0.5pt, below: 0.5pt)",
             );
         }
         _ => {} // unknown level - no change
@@ -2661,27 +2707,27 @@ More text
         assert!(!result.contains("gutter: 3.2mm"));
         assert!(result.contains("gutter: 2.2mm"));
         // Body font should shrink.
-        assert!(result.contains("size: 6.2pt"));
-        assert!(!result.contains("size: 6.5pt,\n  lang:"));
+        assert!(result.contains("size: 6.3pt"));
+        assert!(!result.contains("size: 6.6pt,\n  lang:"));
         // Default heading spacing should tighten.
         assert!(!result.contains("set block(above: 0.8pt, below: 0.4pt)"));
         assert!(result.contains("set block(above: 0.5pt, below: 0.2pt)"));
         // Per-level heading spacing should tighten.
-        assert!(result.contains("set block(above: 1.5pt, below: 0.6pt)"));
-        assert!(result.contains("set block(above: 1pt, below: 0.3pt)"));
-        assert!(result.contains("set block(above: 0.6pt, below: 0.1pt)"));
+        assert!(result.contains("set block(above: 2pt, below: 1pt)"));
+        assert!(result.contains("set block(above: 1.3pt, below: 0.7pt)"));
+        assert!(result.contains("set block(above: 1pt, below: 0.9pt)"));
     }
 
     #[test]
     fn tighter_template_level_2_changes_gutter_more() {
         let result = generate_tighter_typst_template(DEFAULT_TYPST_TEMPLATE, 2);
         assert!(result.contains("gutter: 1.5mm"));
-        assert!(result.contains("size: 5.8pt"));
+        assert!(result.contains("size: 6.0pt"));
         assert!(result.contains("set block(above: 0.3pt, below: 0.1pt)"));
         // Per-level heading spacing should tighten aggressively.
-        assert!(result.contains("set block(above: 0.8pt, below: 0.3pt)"));
-        assert!(result.contains("set block(above: 0.5pt, below: 0.2pt)"));
-        assert!(result.contains("set block(above: 0.3pt, below: 0pt)"));
+        assert!(result.contains("set block(above: 1.2pt, below: 0.6pt)"));
+        assert!(result.contains("set block(above: 0.8pt, below: 0.5pt)"));
+        assert!(result.contains("set block(above: 0.5pt, below: 0.5pt)"));
     }
 
     #[test]
