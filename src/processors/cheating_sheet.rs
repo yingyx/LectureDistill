@@ -257,14 +257,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
             continue;
         }
 
-        update_single_output_progress(
-            process_store,
-            process_id,
-            &output.id,
-            2,
-            4,
-            "rendering LaTeX",
-        );
+        update_single_output_progress(process_store, process_id, &output.id, 2, 4, "rendering PDF");
         let pdf_path = process_output_path_for(
             process_store,
             process_id,
@@ -358,11 +351,13 @@ pub(crate) async fn run_cheating_sheet_outputs(
                     gap.min(12000).max(4000)
                 };
 
-                // Check for overflow: if chars/page already exceeds soft_max per page,
-                // stop expanding — more content would just cause truncation.
+                // Check for overflow only after the output has reached the
+                // allowed page count. If unused pages remain, expansion should
+                // try to spill content onto those pages.
                 let soft_max_per_page = budget.soft_max / max_pages.max(1);
-                let chars_per_page = current_chars as f64 / last_page_count.unwrap_or(1) as f64;
-                if chars_per_page > soft_max_per_page as f64 {
+                let current_pages = last_page_count.unwrap_or(1).max(1);
+                let chars_per_page = current_chars as f64 / current_pages as f64;
+                if current_pages >= max_pages && chars_per_page > soft_max_per_page as f64 {
                     web_log(format!(
                         "job {} cheating-sheet: expansion pass {} — stopping: chars/page={:.0} > soft_max_per_page={} (content likely overflowing)",
                         job_id, pass + 1, chars_per_page, soft_max_per_page,

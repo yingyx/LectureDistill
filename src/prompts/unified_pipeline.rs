@@ -21,7 +21,7 @@ pub(crate) fn build_unified_pipeline_system_prompt(max_pages: usize) -> String {
          timestamps when referencing specific moments.  Do not invent facts \
          beyond the supplied sources.\n\n\
          STAGE 2 — Cheat Sheet: Convert the Reference Digest into a compact \
-         {}–page exam cheat-sheet Markdown for a fixed LaTeX template.  Cover \
+         {}–page exam cheat-sheet Markdown document for the fixed renderer.  Cover \
          every topic comprehensively: for each section, include essential \
          definitions, formulas, conditions, algorithm steps, comparisons, \
          pitfalls, and exam judgement rules.  It is better to include slightly \
@@ -36,16 +36,44 @@ pub(crate) fn build_unified_pipeline_system_prompt(max_pages: usize) -> String {
          ---\n\
          Language: Chinese for Chinese source material; keep standard English \
          technical terms, identifiers, symbols, and formulas.\n\n\
-         Output rules: Return ONLY Markdown for the requested stage, with no \
-         code fences and no explanations.  Do not use raw LaTeX commands except \
-         ordinary math delimited by $...$ or $$...$$.  The Markdown will be \
-         inserted into a XeLaTeX/xeCJK four-column A4 template, so avoid syntax \
-         that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, \
-         nested tables, Mermaid, TikZ, custom macros, \\begin blocks, or \
-         unbalanced braces.  Use only #, ##, ### headings, -, 1. lists, inline \
-         code for identifiers, bold for key terms, and standard Markdown math.  \
-         Every formula must be syntactically balanced.  Keep underscores and \
-         percent signs inside math or code when possible.",
+         Output rules: For Stage 1, return ONLY Reference Digest Markdown. \
+         For Stage 2 and Stage 3, return ONLY Markdown, with no code fences, \
+         no explanations, and no document preamble.  Do not start Stage 2/3 \
+         with a whole-document title such as `# Reference Digest`, \
+         `# Cheat Sheet`, or `# Signals Reference Digest`; start directly \
+         with the first real content section.  Use two content heading levels: \
+         `#` for real top-level sections and `##` for subsections.  Allowed \
+         Stage 2/3 syntax only: headings using `#` and `##`; bullet lists using `-`; \
+         numbered lists using `1.`; LaTeX-style math delimited by `$...$`; \
+         inline code using backticks; bold terms using `**term**`; and simple \
+         horizontal rules using `---`.  Do not emit Typst directives or macros \
+         such as `#set`, `#show`, `#let`, `#import`, `#include`, `#columns`, \
+         `#context`, `#metadata`, `#key[...]`, or `#cheatfact[...]`.  Do not \
+         emit raw HTML, images, footnotes, tables, Mermaid, TikZ, or external \
+         packages.  Use common LaTeX math syntax, e.g. `$\\frac{{a}}{{b}}$`, \
+         `$\\sqrt{{x}}$`, `$\\sum_{{i=1}}^n x_i$`, \
+         `$\\int_{{-\\infty}}^{{\\infty}} f(t)\\,dt$`, `$x \\ne 0$`, \
+         `$x \\le y$`, `$x \\to y$`.  Inside math, insert explicit spaces \
+         or operators between adjacent variables, constants, and functions: \
+         write `$\\omega \\tau$`, `$f \\cos(n\\Omega t)$`, \
+         `$a_n \\cos(n\\Omega t)$`, `$j \\infty$`, `$j 0$`, and `$d\\tau$` \
+         or `$d t$`; do not write `$\\omega\\tau$`, `$f\\cos(...)$`, \
+         `$a_n\\cos(...)$`, `$j\\infty$`, or `$j0$`.  Keep every `$...$` \
+         balanced.",
         max_pages
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unified_prompt_contains_cheatsheet_markdown_constraints() {
+        let prompt = build_unified_pipeline_system_prompt(2);
+        assert!(prompt.contains("whole-document title"));
+        assert!(prompt.contains("\\omega \\tau"));
+        assert!(prompt.contains("j0"));
+        assert!(prompt.contains("Keep every `$...$` balanced"));
+    }
 }

@@ -494,14 +494,7 @@ async fn run_cheat_pipeline_single_pass(
         }
 
         // Render.
-        update_single_output_progress(
-            process_store,
-            process_id,
-            &output.id,
-            2,
-            4,
-            "rendering LaTeX",
-        );
+        update_single_output_progress(process_store, process_id, &output.id, 2, 4, "rendering PDF");
         let pdf_path = process_output_path_for(
             process_store,
             process_id,
@@ -579,11 +572,13 @@ async fn run_cheat_pipeline_single_pass(
                     break;
                 }
 
-                // Check for overflow: if chars/page already exceeds soft_max,
-                // stop expanding — more content would just cause truncation.
-                let chars_per_page = current_chars as f64 / last_page_count.unwrap_or(1) as f64;
+                // Check for overflow only after the output has reached the
+                // allowed page count. If unused pages remain, expansion should
+                // try to spill content onto those pages.
+                let current_pages = last_page_count.unwrap_or(1).max(1);
+                let chars_per_page = current_chars as f64 / current_pages as f64;
                 let soft_max_per_page = budget.soft_max / output_max_pages.max(1);
-                if chars_per_page > soft_max_per_page as f64 {
+                if current_pages >= output_max_pages && chars_per_page > soft_max_per_page as f64 {
                     web_log(format!(
                         "job {} unified-pipeline: expansion pass {} — stopping: chars/page={:.0} > soft_max_per_page={} (content likely overflowing)",
                         job_id, pass + 1, chars_per_page, soft_max_per_page,
@@ -1187,14 +1182,7 @@ async fn write_digest_and_process_cheat_sheets(
         }
 
         // Render.
-        update_single_output_progress(
-            process_store,
-            process_id,
-            &output.id,
-            2,
-            4,
-            "rendering LaTeX",
-        );
+        update_single_output_progress(process_store, process_id, &output.id, 2, 4, "rendering PDF");
         let pdf_path = process_output_path_for(
             process_store,
             process_id,

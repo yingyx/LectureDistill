@@ -9,6 +9,31 @@ use crate::utils::budget::{
 };
 use crate::utils::calibration::CalibrationData;
 
+const CHEAT_SHEET_MARKDOWN_RULES: &str = "\
+Return ONLY a Markdown cheat sheet, with no code fences, no explanations, and no document preamble. \
+The renderer will convert this Markdown into the fixed Typst template. \
+Do NOT start with a whole-document title such as `# Reference Digest`, `# Cheat Sheet`, or `# Signals Reference Digest`; start directly with the first real content section. \
+Use two content heading levels: `#` for real top-level sections and `##` for subsections. \
+Allowed syntax only: headings using `#` and `##`; bullet lists using `-`; numbered lists using `1.`; \
+LaTeX-style math delimited by `$...$`; inline code using backticks; bold terms using `**term**`; \
+and simple horizontal rules using `---`. \
+Do NOT emit Typst directives or macros such as `#set`, `#show`, `#let`, `#import`, `#include`, `#columns`, `#context`, `#metadata`, `#key[...]`, or `#cheatfact[...]`. \
+Do NOT emit raw HTML, images, footnotes, tables, Mermaid, TikZ, or external packages. \
+Use common LaTeX math syntax, e.g. `$\\frac{a}{b}$`, `$\\sqrt{x}$`, `$\\sum_{i=1}^n x_i$`, `$\\int_{-\\infty}^{\\infty} f(t)\\,dt$`, `$x \\ne 0$`, `$x \\le y$`, `$x \\to y$`. \
+Inside math, insert explicit spaces or operators between adjacent variables, constants, and functions: write `$\\omega \\tau$`, `$f \\cos(n\\Omega t)$`, `$a_n \\cos(n\\Omega t)$`, `$j \\infty$`, `$j 0$`, and `$d\\tau$`/`$d t$`; do not write `$\\omega\\tau$`, `$f\\cos(...)$`, `$a_n\\cos(...)$`, `$j\\infty$`, or `$j0$`. \
+Keep every `$...$` balanced.";
+
+const CHEAT_SHEET_MARKDOWN_EXAMPLE: &str = "\
+Example Markdown cheat sheet:\n\
+# Signals\n\
+## Key identities\n\
+- **Linearity**: $a x(t) + b y(t) \\to a X(f) + b Y(f)$.\n\
+- **Convolution**: time-domain convolution corresponds to frequency-domain multiplication.\n\
+1. Check bandwidth $B$.\n\
+2. Apply sampling condition $f_s > 2B$.\n\
+---\n\
+- **Exam rule**: If a system is LTI, first identify $h(t)$ and use $y(t)=x(t)*h(t)$.";
+
 /// Build the Turn 2 user prompt: compress the Reference Digest into a cheat sheet.
 ///
 /// The Reference Digest is NOT repeated here — it is already in the
@@ -32,6 +57,8 @@ pub(crate) fn build_cheat_sheet_turn2_prompt(
          Section inventory:\n{}\n\n\
          Do not invent new facts.  Extract and organize the essential content from \
          the Reference Digest you created above.  Prefer completeness over conciseness.\n\n\
+         {}\n\n\
+         {}\n\n\
          Return only the complete cheating-sheet Markdown.  Aim for {}; more is acceptable.",
         max_pages,
         target_text,
@@ -39,6 +66,8 @@ pub(crate) fn build_cheat_sheet_turn2_prompt(
         section_count,
         section_names,
         inventory,
+        CHEAT_SHEET_MARKDOWN_RULES,
+        CHEAT_SHEET_MARKDOWN_EXAMPLE,
         target_text,
     )
 }
@@ -67,8 +96,9 @@ pub(crate) fn build_expansion_turn3_prompt(
          conditions, pitfalls, algorithm steps, comparisons, and judgement \
          rules.  Do NOT add narrative, examples without reusable patterns, \
          or anything already covered.\n\n\
+         {}\n\n\
          Return the complete expanded cheat-sheet Markdown.",
-        unit, inventory
+        unit, inventory, CHEAT_SHEET_MARKDOWN_RULES
     )
 }
 
@@ -94,23 +124,18 @@ pub(crate) fn build_cheat_sheet_prompts(
 
     let target_text = format_target(&budget);
 
-    let system_prompt = "You convert a Reference Digest into an exam reference cheat-sheet Markdown \
-for a fixed LaTeX template. Cover every topic comprehensively: for each section, include its essential \
+    let system_prompt = format!(
+        "You convert a Reference Digest into an exam reference cheat-sheet Markdown document \
+for a fixed renderer. Cover every topic comprehensively: for each section, include its essential \
 definitions, formulas, conditions, algorithm steps, comparisons, pitfalls, and exam judgement rules. \
 It is better to include slightly too much content than too little — the renderer will compress if \
 needed. Do not omit topics.\n\
-Return ONLY Markdown, with no code fences, no explanations, and no raw LaTeX commands except ordinary \
-math delimited by $...$ or $$...$$. \
-The Markdown will be escaped and inserted into a XeLaTeX/xeCJK A4 template, so avoid \
-syntax that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, nested tables, \
-Mermaid, TikZ, custom macros, \\begin blocks, or unbalanced braces. \
 Use Chinese for Chinese source material, keep standard English technical terms, identifiers, and formulas. \
 Prefer short headings, information-rich bullets, definitions, theorem/condition/result patterns, \
-formulas, contrasts, and procedure steps. \
-Use only #, ##, ### headings, -, 1. lists, inline code for identifiers, bold for key terms, \
-and standard Markdown math. \
-Every formula must be syntactically balanced. Keep underscores and percent signs inside math or code \
-when possible.";
+formulas, contrasts, and procedure steps.\n\
+{}\n\n{}",
+        CHEAT_SHEET_MARKDOWN_RULES, CHEAT_SHEET_MARKDOWN_EXAMPLE
+    );
 
     let user_prompt = format!(
         "Target: a {} page(s) exam cheat sheet.\n\
@@ -122,6 +147,8 @@ Do not invent new facts. Extract and organize the essential content from the Ref
 Prefer completeness over conciseness.\n\n\
 Section inventory:\n{}\n\n\
 Reference Digest Markdown:\n\n{}\n\n\
+{}\n\n\
+{}\n\n\
 Return only the complete cheating-sheet Markdown. Aim for {}; more is acceptable.",
         max_pages,
         target_text,
@@ -130,10 +157,12 @@ Return only the complete cheating-sheet Markdown. Aim for {}; more is acceptable
         section_names,
         inventory,
         truncate_ref_digest_for_cheatsheet(ref_digest_markdown, 90000).0,
+        CHEAT_SHEET_MARKDOWN_RULES,
+        CHEAT_SHEET_MARKDOWN_EXAMPLE,
         target_text,
     );
 
-    (system_prompt.to_string(), user_prompt)
+    (system_prompt, user_prompt)
 }
 
 /// Build expansion prompts for standalone (non-unified) cheat sheet generation.
@@ -151,19 +180,17 @@ pub(crate) fn build_expansion_prompt(
         Language::English => format!("{} words", target_add_chars / 5),
     };
 
-    let system_prompt = "You expand an existing exam cheat-sheet Markdown by adding high-value material \
+    let system_prompt = format!(
+        "You expand an existing exam cheat-sheet Markdown document by adding high-value material \
 from the Reference Digest. Preserve the existing structure, headings, and content exactly as-is. \
 Only add new material where it fits naturally: definitions, formulas, conditions, algorithm steps, \
 pitfalls, comparisons, and exam judgement rules that are in the Reference Digest but missing from \
 the cheat sheet. It is better to add slightly too much than too little — the renderer will compress \
 if needed. \
 Do not fabricate facts, do not rewrite existing sections, and do not change the document structure. \
-Return ONLY Markdown, with no code fences, no explanations, and no raw LaTeX commands except ordinary \
-math delimited by $...$ or $$...$$. The Markdown will be inserted into a XeLaTeX/xeCJK four-column A4 \
-template, so avoid syntax that commonly breaks LaTeX: no HTML, images, footnotes, Markdown tables, \
-nested tables, Mermaid, TikZ, custom macros, \\begin blocks, or unbalanced braces. \
-Use only #, ##, ### headings, -, 1. lists, inline code for identifiers, bold for key terms, \
-and standard Markdown math.";
+{}\n\n{}",
+        CHEAT_SHEET_MARKDOWN_RULES, CHEAT_SHEET_MARKDOWN_EXAMPLE
+    );
 
     let user_prompt = format!(
         "The existing cheat sheet below should be expanded with missing high-value content \
@@ -171,7 +198,7 @@ from the Reference Digest. \
 Add approximately {} of high-value material. \
 Maintain the exact same heading hierarchy and document structure.\n\n\
 Section inventory (all sections must remain covered):\n{}\n\n\
-Existing cheat sheet:\n{}\n\n\
+Existing cheat sheet Markdown:\n{}\n\n\
 Reference Digest excerpt:\n{}\n\n\
 Add the most exam-critical missing material: definitions, formulas, conditions, pitfalls, \
 algorithm steps, comparisons, and judgement rules. Do NOT add narrative, examples without \
@@ -180,7 +207,7 @@ Return the complete expanded cheat-sheet Markdown.",
         unit, section_inventory, current_cheat, ref_digest_excerpt
     );
 
-    (system_prompt.to_string(), user_prompt)
+    (system_prompt, user_prompt)
 }
 
 #[cfg(test)]
@@ -224,13 +251,17 @@ mod tests {
     }
 
     #[test]
-    fn test_expansion_prompt_contains_latex_safety_constraints() {
+    fn test_expansion_prompt_contains_markdown_constraints() {
         let (sys, _) =
             build_expansion_prompt("# CS", "# H\n  body: x\n", "# RD", 100, Language::Chinese);
-        assert!(sys.contains("XeLaTeX"));
-        assert!(sys.contains("unbalanced braces"));
-        // LaTeX safety: the system prompt should mention LaTeX and brace safety.
-        assert!(sys.contains("LaTeX") || sys.contains("latex"));
+        assert!(sys.contains("Markdown"));
+        assert!(sys.contains("LaTeX-style math"));
+        assert!(sys.contains("**term**"));
+        assert!(sys.contains("#set"));
+        assert!(sys.contains("balanced"));
+        assert!(sys.contains("whole-document title"));
+        assert!(sys.contains("\\omega \\tau"));
+        assert!(sys.contains("j0"));
     }
 
     #[test]

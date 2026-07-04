@@ -472,7 +472,16 @@ pub fn compile_typst(
             .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
     }
 
-    let status = Command::new(typst_compiler)
+    if output_pdf_path.exists() {
+        fs::remove_file(output_pdf_path).with_context(|| {
+            format!(
+                "failed to remove stale Typst output before compile: {}",
+                output_pdf_path.display()
+            )
+        })?;
+    }
+
+    let output = Command::new(typst_compiler)
         .args([
             "compile",
             &typ_path.to_string_lossy(),
@@ -480,17 +489,28 @@ pub fn compile_typst(
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .with_context(|| format!("failed to run typst: {}", typst_compiler))?;
 
-    if !output_pdf_path.exists() {
-        bail!("typst did not produce a PDF file (exit status: {})", status);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "typst failed with status {}{}{}",
+            output.status,
+            if stderr.trim().is_empty() { "" } else { ": " },
+            if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            }
+        );
     }
 
-    if !status.success() {
-        log::warn!(
-            "typst exited with non-zero status {} but PDF was produced",
-            status
+    if !output_pdf_path.exists() {
+        bail!(
+            "typst did not produce a PDF file (exit status: {})",
+            output.status
         );
     }
 
@@ -1474,8 +1494,11 @@ fn translate_latex_math_to_typst(math: &str) -> String {
         (r"\approx", "≈"),
         (r"\equiv", "≡"),
         (r"\neq", "≠"),
+        (r"\ne", "≠"),
         (r"\leq", "≤"),
+        (r"\le", "≤"),
         (r"\geq", "≥"),
+        (r"\ge", "≥"),
         (r"\ll", "≪"),
         (r"\gg", "≫"),
         (r"\sim", "∼"),
@@ -1559,7 +1582,7 @@ fn translate_latex_math_to_typst(math: &str) -> String {
         (r"\mod", "mod"),
     ];
 
-    let mut result = math.to_string();
+    let mut result = normalize_latex_math_to_typst_aliases(math);
     // Sort by descending length to avoid partial matches (e.g. \rightarrow before \to).
     let mut sorted: Vec<&(&str, &str)> = replacements.iter().collect();
     sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -1567,6 +1590,12 @@ fn translate_latex_math_to_typst(math: &str) -> String {
     for (latex, typst) in &sorted {
         result = result.replace(latex, typst);
     }
+
+    result =
+        Regex::new(r"_([A-Za-z0-9]+?)(sin|cos|tan|arcsin|arccos|arctan|log|ln|lim|min|max)(\()")
+            .unwrap()
+            .replace_all(&result, "_$1 $2$3")
+            .to_string();
 
     // Fix: In Typst math mode, adjacent Latin letters are treated as a SINGLE
     // multi-character variable (e.g. "ax" means variable "ax", not a·x).
@@ -1581,21 +1610,130 @@ fn translate_latex_math_to_typst(math: &str) -> String {
     // `([a-zA-Z])([a-zA-Z])` doesn't match across sentinel boundaries.
     let math_funcs = &[
         "sin", "cos", "tan", "arcsin", "arccos", "arctan", "log", "ln", "lg", "lim", "max", "min",
-        "sup", "inf", "det", "gcd", "mod",
+        "sup", "inf", "det", "gcd", "mod", "cases", "sqrt", "sum", "prod", "integral", "infinity",
+        "cal", "delta", "omega", "theta", "lambda", "sigma", "tau", "pi", "phi", "varphi", "Delta",
+        "Omega", "int", "infty", "dt", "dif",
     ];
     // Temporarily protect math functions with \x01 sentinels.
-    for (i, func) in math_funcs.iter().enumerate() {
-        result = result.replace(func, &format!("\x01MF{}\x01", i));
+    let mut protected_funcs = math_funcs.to_vec();
+    protected_funcs.sort_by_key(|func| std::cmp::Reverse(func.len()));
+    for (i, func) in protected_funcs.iter().enumerate() {
+        result = result.replace(func, &format!("\x01{}\x01", i));
     }
-    // Separate adjacent Latin letters.
-    let letter_pair = regex::Regex::new(r"([a-zA-Z])([a-zA-Z])").unwrap();
-    result = letter_pair.replace_all(&result, "$1 $2").to_string();
+    let callable_funcs = [
+        "sin", "cos", "tan", "arcsin", "arccos", "arctan", "log", "ln", "lg", "lim", "max", "min",
+        "sup", "inf", "det", "gcd", "mod", "sqrt", "cal", "infinity",
+    ];
+    for (i, func) in protected_funcs.iter().enumerate() {
+        if callable_funcs.contains(func) {
+            let token = format!("\x01{}\x01", i);
+            let pattern = Regex::new(&format!(r"([A-Za-z0-9]){}", regex::escape(&token))).unwrap();
+            let replacement = format!("$1 {}", token);
+            result = pattern
+                .replace_all(&result, replacement.as_str())
+                .to_string();
+        }
+    }
+    // Separate adjacent letters outside quoted Typst math text.
+    result = separate_adjacent_math_letters_outside_quotes(&result);
     // Restore math functions.  \x01 sentinels prevent regex corruption.
-    for (i, func) in math_funcs.iter().enumerate() {
-        result = result.replace(&format!("\x01MF{}\x01", i), func);
+    for (i, func) in protected_funcs.iter().enumerate() {
+        result = result.replace(&format!("\x01{}\x01", i), func);
     }
 
     result
+}
+
+fn separate_adjacent_math_letters_outside_quotes(input: &str) -> String {
+    fn flush_segment(
+        output: &mut String,
+        segment: &mut String,
+        letter_pair: &Regex,
+        letter_digit: &Regex,
+        digit_letter: &Regex,
+        ascii_greek: &Regex,
+        greek_ascii: &Regex,
+        greek_pair: &Regex,
+    ) {
+        if !segment.is_empty() {
+            let mut separated = segment.to_string();
+            loop {
+                let next = letter_pair.replace_all(&separated, "$1 $2").to_string();
+                if next == separated {
+                    break;
+                }
+                separated = next;
+            }
+            let separated = letter_digit.replace_all(&separated, "$1 $2").to_string();
+            let separated = digit_letter.replace_all(&separated, "$1 $2").to_string();
+            let separated = ascii_greek.replace_all(&separated, "$1 $2").to_string();
+            let separated = greek_ascii.replace_all(&separated, "$1 $2").to_string();
+            let mut separated = separated;
+            loop {
+                let next = greek_pair.replace_all(&separated, "$1 $2").to_string();
+                if next == separated {
+                    break;
+                }
+                separated = next;
+            }
+            output.push_str(&separated);
+            segment.clear();
+        }
+    }
+
+    let letter_pair = Regex::new(r"([a-zA-Z])([a-zA-Z])").unwrap();
+    let letter_digit = Regex::new(r"([A-Za-z])([0-9])").unwrap();
+    let digit_letter = Regex::new(r"([0-9])([A-Za-z])").unwrap();
+    let ascii_greek = Regex::new(r"([A-Za-z])(\p{Greek})").unwrap();
+    let greek_ascii = Regex::new(r"(\p{Greek})([A-Za-z])").unwrap();
+    let greek_pair = Regex::new(r"(\p{Greek})(\p{Greek})").unwrap();
+    let mut output = String::with_capacity(input.len());
+    let mut segment = String::new();
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if in_quote {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            flush_segment(
+                &mut output,
+                &mut segment,
+                &letter_pair,
+                &letter_digit,
+                &digit_letter,
+                &ascii_greek,
+                &greek_ascii,
+                &greek_pair,
+            );
+            output.push(ch);
+            in_quote = true;
+        } else {
+            segment.push(ch);
+        }
+    }
+
+    flush_segment(
+        &mut output,
+        &mut segment,
+        &letter_pair,
+        &letter_digit,
+        &digit_letter,
+        &ascii_greek,
+        &greek_ascii,
+        &greek_pair,
+    );
+    output
 }
 
 fn escape_typst_plain(text: &str) -> String {
@@ -1655,36 +1793,273 @@ fn markdown_inline_to_typst_no_code(text: &str) -> String {
 }
 
 fn escape_typst_with_emphasis(text: &str) -> String {
-    let bold_re = Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-    let italic_re = Regex::new(r"(?P<pre>^|[^*])\*([^*]+)\*").unwrap();
+    let mut out = String::new();
+    let mut rest = text;
 
-    let mut result = String::new();
-    let mut last = 0;
-    for caps in bold_re.captures_iter(text) {
-        let mat = caps.get(0).unwrap();
-        result.push_str(&escape_typst_plain(&text[last..mat.start()]));
-        result.push('*');
-        result.push_str(&escape_typst_plain(&caps[1]));
-        result.push('*');
-        last = mat.end();
-    }
-    result.push_str(&escape_typst_plain(&text[last..]));
+    while let Some(star_pos) = rest.find('*') {
+        out.push_str(&escape_typst_plain(&rest[..star_pos]));
+        rest = &rest[star_pos..];
 
-    let mut converted = String::new();
-    let mut last = 0;
-    for caps in italic_re.captures_iter(&result) {
-        let mat = caps.get(0).unwrap();
-        let pre = caps.name("pre").map(|m| m.as_str()).unwrap_or("");
-        let body = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        converted.push_str(&result[last..mat.start()]);
-        converted.push_str(pre);
-        converted.push('_');
-        converted.push_str(body);
-        converted.push('_');
-        last = mat.end();
+        if let Some(after_open) = rest.strip_prefix("**") {
+            if let Some(end) = after_open.find("**") {
+                out.push('*');
+                out.push_str(&escape_typst_plain(&after_open[..end]));
+                out.push('*');
+                rest = &after_open[end + 2..];
+                continue;
+            }
+            out.push_str("\\*\\*");
+            rest = after_open;
+            continue;
+        }
+
+        if let Some(after_open) = rest.strip_prefix('*') {
+            if let Some(end) = after_open.find('*') {
+                out.push('_');
+                out.push_str(&escape_typst_plain(&after_open[..end]));
+                out.push('_');
+                rest = &after_open[end + 1..];
+                continue;
+            }
+            out.push_str("\\*");
+            rest = after_open;
+            continue;
+        }
     }
-    converted.push_str(&result[last..]);
-    converted
+
+    out.push_str(&escape_typst_plain(rest));
+    out
+}
+
+fn normalize_typst_cases_function(math: &str) -> String {
+    let mut output = String::with_capacity(math.len());
+    let mut rest = math;
+
+    while let Some(start) = rest.find("cases(") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + "cases(".len()..];
+        let mut depth = 1isize;
+        let mut end_byte = None;
+
+        for (idx, ch) in after_start.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_byte = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let Some(end) = end_byte else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+
+        let body = &after_start[..end];
+        let rows: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if rows.len() >= 2 {
+            let converted_rows: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    if let Some((value, condition)) = row.split_once(',') {
+                        format!("{} \"if\" {}", value.trim(), condition.trim())
+                    } else {
+                        row.to_string()
+                    }
+                })
+                .collect();
+            output.push_str("cases(");
+            output.push_str(&converted_rows.join(", "));
+            output.push(')');
+        } else {
+            output.push_str("cases(");
+            output.push_str(body);
+            output.push(')');
+        }
+
+        rest = &after_start[end + 1..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn normalize_latex_cases_environment(math: &str) -> String {
+    let mut output = String::with_capacity(math.len());
+    let mut rest = math;
+    const BEGIN: &str = r"\begin{cases}";
+    const END: &str = r"\end{cases}";
+
+    while let Some(start) = rest.find(BEGIN) {
+        output.push_str(&rest[..start]);
+        let after_begin = &rest[start + BEGIN.len()..];
+        let Some(end) = after_begin.find(END) else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+
+        let body = &after_begin[..end];
+        let rows: Vec<String> = body
+            .split(r"\\")
+            .map(str::trim)
+            .filter(|row| !row.is_empty())
+            .map(|row| {
+                if let Some((value, condition)) = row.split_once('&') {
+                    let value = value.trim().trim_end_matches(',').trim();
+                    let condition = condition.trim();
+                    if condition.is_empty() {
+                        value.to_string()
+                    } else {
+                        format!("{} \"if\" {}", value, condition)
+                    }
+                } else {
+                    row.trim_end_matches(',').trim().to_string()
+                }
+            })
+            .collect();
+
+        output.push_str("cases(");
+        output.push_str(&rows.join(", "));
+        output.push(')');
+        rest = &after_begin[end + END.len()..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn parse_latex_braced_group(input: &str) -> Option<(&str, usize)> {
+    if !input.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0isize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&input[1..idx], idx + ch.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn normalize_latex_frac_commands(math: &str) -> String {
+    let mut output = String::with_capacity(math.len());
+    let mut rest = math;
+    const FRAC: &str = r"\frac";
+
+    while let Some(start) = rest.find(FRAC) {
+        output.push_str(&rest[..start]);
+        let after_command = &rest[start + FRAC.len()..];
+        let Some((numerator, numerator_end)) = parse_latex_braced_group(after_command) else {
+            output.push_str(&rest[start..start + FRAC.len()]);
+            rest = after_command;
+            continue;
+        };
+        let after_numerator = &after_command[numerator_end..];
+        let Some((denominator, denominator_end)) = parse_latex_braced_group(after_numerator) else {
+            output.push_str(&rest[start..start + FRAC.len() + numerator_end]);
+            rest = after_numerator;
+            continue;
+        };
+
+        output.push('(');
+        output.push_str(numerator);
+        output.push_str(") / (");
+        output.push_str(denominator);
+        output.push(')');
+        rest = &after_numerator[denominator_end..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn normalize_latex_math_to_typst_aliases(math: &str) -> String {
+    let mut normalized = normalize_latex_cases_environment(math);
+    normalized = normalize_typst_cases_function(&normalized);
+    normalized = normalize_latex_frac_commands(&normalized);
+    normalized = Regex::new(r"\\(?:text|mathrm)\{([^{}]+)\}")
+        .unwrap()
+        .replace_all(&normalized, "\"$1\"")
+        .to_string();
+    normalized = Regex::new(r"\\mathcal\{([A-Za-z])\}")
+        .unwrap()
+        .replace_all(&normalized, "cal($1)")
+        .to_string();
+    normalized = normalized.replace(r"\int", "integral");
+    normalized = normalized.replace(r"\infty", "infinity");
+    normalized = normalized.replace(r"\cdot", "\u{22c5}");
+    normalized = normalized.replace(r"\,", " ");
+    normalized = normalized.replace(r"\ ", " ");
+    normalized = normalized.replace(r"\!", "");
+    normalized = normalized.replace(r"\{", "(");
+    normalized = normalized.replace(r"\}", ")");
+    normalized = Regex::new(r"\\?frac\{([^{}]+)\}\{([^{}]+)\}")
+        .unwrap()
+        .replace_all(&normalized, "($1) / ($2)")
+        .to_string();
+    normalized = Regex::new(r"\\?frac([A-Za-z0-9]+)\{([^{}]+)\}")
+        .unwrap()
+        .replace_all(&normalized, "$1 / ($2)")
+        .to_string();
+    normalized = Regex::new(r"\\?frac([0-9]+)([A-Za-z]+)\b")
+        .unwrap()
+        .replace_all(&normalized, "$1 / $2")
+        .to_string();
+    normalized = Regex::new(r"\\?sqrt\{([^{}]+)\}")
+        .unwrap()
+        .replace_all(&normalized, "sqrt($1)")
+        .to_string();
+    normalized = normalized.replace("int_", "integral_");
+    normalized = normalized.replace("int ", "integral ");
+    normalized = normalized.replace("infty", "infinity");
+    normalized = normalized.replace("cdot", "\u{22c5}");
+    normalized = normalized.replace("varphi", "φ");
+    normalized = Regex::new(r"\bphi\b")
+        .unwrap()
+        .replace_all(&normalized, "φ")
+        .to_string();
+    normalized = Regex::new(r"_([A-Za-z]{2,})\b")
+        .unwrap()
+        .replace_all(&normalized, "_(\"$1\")")
+        .to_string();
+    normalized = Regex::new(r"\bdt\b")
+        .unwrap()
+        .replace_all(&normalized, "dif t")
+        .to_string();
+    normalized = Regex::new(r"\bd\s+tau\b")
+        .unwrap()
+        .replace_all(&normalized, "dif tau")
+        .to_string();
+    normalized = Regex::new(r"\^([a-z]{2})\b")
+        .unwrap()
+        .replace_all(&normalized, |caps: &regex::Captures| {
+            let spaced = caps[1]
+                .chars()
+                .map(|ch| ch.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("^({})", spaced)
+        })
+        .to_string();
+    normalized
 }
 
 /// Convert a small Markdown subset to Typst markup for the cheat-sheet template.
@@ -1692,9 +2067,11 @@ pub fn markdown_to_typst(md_content: &str) -> String {
     let heading_re = Regex::new(r"^(#{1,6})\s+(.*)$").unwrap();
     let unordered_re = Regex::new(r"^\s*[-*]\s+(.*)$").unwrap();
     let ordered_re = Regex::new(r"^\s*\d+[\.)]\s+(.*)$").unwrap();
+    let content_heading_base = first_content_heading_level(md_content, &heading_re).unwrap_or(1);
 
     let mut output = String::new();
     let mut in_raw_block = false;
+    let mut seen_content = false;
 
     for line in md_content.lines() {
         let trimmed = line.trim();
@@ -1707,36 +2084,95 @@ pub fn markdown_to_typst(md_content: &str) -> String {
             continue;
         }
         if trimmed.is_empty() {
-            output.push('\n');
+            if seen_content {
+                output.push('\n');
+            }
             continue;
         }
         if trimmed == "---" || trimmed == "***" || trimmed == "___" {
             output.push_str("#line(length: 100%, stroke: 0.4pt + rgb(\"#808080\"))\n");
+            seen_content = true;
             continue;
         }
 
         if let Some(caps) = heading_re.captures(trimmed) {
-            let level = caps.get(1).unwrap().as_str().len().min(6);
-            let text = markdown_inline_to_typst(caps.get(2).unwrap().as_str());
+            let heading_marks = caps.get(1).unwrap().as_str();
+            let raw_text = caps.get(2).unwrap().as_str();
+            if !seen_content
+                && heading_marks.len() == 1
+                && is_likely_document_title_heading(raw_text)
+            {
+                continue;
+            }
+            let level = heading_marks
+                .len()
+                .saturating_sub(content_heading_base)
+                .saturating_add(1)
+                .clamp(1, 6);
+            let text = markdown_inline_to_typst(raw_text);
             output.push_str(&format!("{} {}\n", "=".repeat(level), text));
+            seen_content = true;
             continue;
         }
 
         if let Some(caps) = unordered_re.captures(trimmed) {
             output.push_str(&format!("- {}\n", markdown_inline_to_typst(&caps[1])));
+            seen_content = true;
             continue;
         }
 
         if let Some(caps) = ordered_re.captures(trimmed) {
             output.push_str(&format!("+ {}\n", markdown_inline_to_typst(&caps[1])));
+            seen_content = true;
             continue;
         }
 
         output.push_str(&markdown_inline_to_typst(trimmed));
         output.push('\n');
+        seen_content = true;
     }
 
     output
+}
+
+fn first_content_heading_level(md_content: &str, heading_re: &Regex) -> Option<usize> {
+    let mut in_raw_block = false;
+    let mut seen_content = false;
+
+    for line in md_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_raw_block = !in_raw_block;
+            continue;
+        }
+        if in_raw_block || trimmed.starts_with("<!--") || trimmed.starts_with('>') {
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(caps) = heading_re.captures(trimmed) {
+            let level = caps.get(1).unwrap().as_str().len();
+            let raw_text = caps.get(2).unwrap().as_str();
+            if !seen_content && level == 1 && is_likely_document_title_heading(raw_text) {
+                continue;
+            }
+            return Some(level);
+        }
+
+        seen_content = true;
+    }
+
+    None
+}
+
+fn is_likely_document_title_heading(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    normalized.contains("reference digest")
+        || normalized.contains("cheat sheet")
+        || normalized.contains("cheating sheet")
+        || normalized.contains("参考摘要")
+        || normalized.contains("速查")
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,18 +2227,20 @@ fn resolve_typst_template(template_path: Option<&str>) -> Result<String> {
 
 /// Render a cheat sheet PDF from distilled Markdown.
 ///
-/// 1. Resolve template (use provided path, fallback to embedded [`DEFAULT_TEMPLATE`])
-/// 2. Verify `{{content}}` placeholder exists in template
-/// 3. Read input markdown, convert to LaTeX via [`markdown_to_latex`]
-/// 4. Find compiler (error if none found)
-/// 5. Loop up to 4 iterations (attempt 0 + 3 compression attempts):
+/// 1. Resolve templates (use provided path, fallback to embedded defaults)
+/// 2. Verify `{{content}}` placeholder exists in templates
+/// 3. Read input content
+/// 4. Prefer Typst compilation:
+///    - Convert Markdown to the supported Typst subset
+/// 5. Fall back to LaTeX if Typst is unavailable or cannot render
+/// 6. Loop up to 4 iterations (attempt 0 + 3 compression attempts):
 ///    - Apply compression if attempt > 0
-///    - Replace `{{content}}` in template with LaTeX body
-///    - Write `cheatsheet.tex` in output directory
+///    - Replace `{{content}}` in the selected template
+///    - Write `cheatsheet.typ` or `cheatsheet.tex` in output directory
 ///    - Compile; catch errors
 ///    - Count pages; if <= `max_pages`, copy PDF to final path and return
 ///      [`CheatSheetArtifact`]
-/// 6. If all attempts exhausted, return error
+/// 7. If all attempts exhausted, return error
 pub fn render_cheatsheet(
     input_md_path: &str,
     template_path: Option<&str>,
@@ -1824,6 +2262,7 @@ pub fn render_cheatsheet(
     // 3. Read and convert markdown
     let md_content = fs::read_to_string(input_md_path)
         .with_context(|| format!("failed to read input markdown: {}", input_md_path))?;
+    let md_content = md_content.trim_start_matches('\u{feff}').to_string();
 
     // 4. Find PDF renderers. Typst is preferred; LaTeX remains the fallback.
     let typst_compiler = find_typst_compiler();
@@ -2556,6 +2995,104 @@ More text
         let latex = markdown_to_latex(md);
         assert!(latex.contains(r"\item list item"));
         assert!(!latex.contains(r"\textit{"));
+    }
+
+    // -- Markdown -> Typst ------------------------------------------------
+
+    #[test]
+    fn markdown_to_typst_starts_headings_at_template_main_section_level() {
+        let typst = markdown_to_typst("# Signals\n## Fourier\n### Key identities");
+        assert!(typst.contains("= Signals"));
+        assert!(typst.contains("== Fourier"));
+        assert!(typst.contains("=== Key identities"));
+    }
+
+    #[test]
+    fn markdown_to_typst_drops_obvious_document_title() {
+        let typst = markdown_to_typst(
+            "# Signals and Systems Reference Digest\n\n## Signal Basics\n- definition",
+        );
+        assert!(!typst.contains("Reference Digest"));
+        assert!(typst.starts_with("= Signal Basics"));
+    }
+
+    #[test]
+    fn markdown_to_typst_keeps_first_real_content_heading() {
+        let typst = markdown_to_typst("# Signal Basics\n- definition");
+        assert!(typst.starts_with("= Signal Basics"));
+    }
+
+    #[test]
+    fn markdown_to_typst_converts_common_latex_math_subset() {
+        let typst = markdown_to_typst(
+            "- **Rule**: $\\frac{a}{b}$, $\\sqrt{x}$, $\\int_{-\\infty}^{\\infty} f(t)\\,dt$",
+        );
+        assert!(typst.contains("*Rule*"));
+        assert!(typst.contains("(a) / (b)"));
+        assert!(typst.contains("sqrt(x)"));
+        assert!(typst.contains("integral_{-infinity}^{infinity}"));
+    }
+
+    #[test]
+    fn markdown_to_typst_converts_latex_cases_and_short_relations() {
+        let typst = markdown_to_typst(
+            "- $u(t)=\\begin{cases}0,&t<0\\\\1,&t\\ge0\\end{cases}$ and $\\frac{du(t)}{dt}$",
+        );
+        assert!(
+            typst.contains("cases(0 \"if\" t<0, 1 \"if\" t\u{2265}0)"),
+            "{typst}"
+        );
+        assert!(typst.contains("(d u(t)) / (dif t)"));
+        let typst = markdown_to_typst("- $u(t)=\\int_{-\\infty}^t\\delta(\\tau)d\\tau$");
+        assert!(typst.contains("integral_{-infinity}^t δ(τ)d τ"), "{typst}");
+        let typst = markdown_to_typst("- $\\text{Re}(s)>0$ and $\\mathcal{F}\\{h(t)\\}$");
+        assert!(typst.contains("\"Re\"(s)>0"), "{typst}");
+        assert!(typst.contains("cal(F)(h(t))"), "{typst}");
+        let typst = markdown_to_typst("- $a_n\\cos(n\\Omega t)+b_n\\sin(n\\Omega t)$");
+        assert!(typst.contains("a_n cos(n Ω t)+b_n sin(n Ω t)"), "{typst}");
+        let typst = markdown_to_typst("- $\\int f\\cos(n\\Omega t)dt + \\arccos(x)$");
+        assert!(
+            typst.contains("integral f cos(n Ω t)dif t + arccos(x)"),
+            "{typst}"
+        );
+        let typst = markdown_to_typst("- $F(j0)=1$");
+        assert!(typst.contains("F(j 0)=1"), "{typst}");
+        let typst = markdown_to_typst("- $a\\tau \\cdot \\text{sinc}(\\omega\\tau/2)$");
+        assert!(typst.contains("a τ ⋅ \"sinc\"(ω τ/2)"), "{typst}");
+        let typst = markdown_to_typst("- $\\frac{1}{1-ae^{-j\\omega}}$");
+        assert!(typst.contains("(1) / (1-a e^{-j ω})"), "{typst}");
+        let typst = markdown_to_typst("- $1\\ (all\\ n)$");
+        assert!(typst.contains("1 (a l l n)"), "{typst}");
+        let typst = markdown_to_typst("- $\\sigma_0-j\\infty$");
+        assert!(typst.contains("σ_0-j infinity"), "{typst}");
+    }
+
+    #[test]
+    fn compile_typst_failure_does_not_reuse_stale_pdf() {
+        let typst = find_typst_compiler();
+        if typst.is_empty() {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "lecture-distill-typst-stale-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let typ_path = dir.join("invalid.typ");
+        let pdf_path = dir.join("invalid.pdf");
+        fs::write(&typ_path, "$cases(0, t < 0; 1, t > 0)$").unwrap();
+        fs::write(&pdf_path, b"stale").unwrap();
+
+        let err = compile_typst(
+            &typ_path.to_string_lossy(),
+            &pdf_path.to_string_lossy(),
+            &typst,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("typst failed"));
+        assert!(!pdf_path.exists());
     }
 
     // -- parse_typst_length_to_mm ----------------------------------------
