@@ -2,6 +2,7 @@ pub mod app;
 pub mod course;
 pub mod handlers;
 pub mod jobs;
+pub mod plugins;
 pub mod processes;
 pub mod secrets;
 pub mod sources;

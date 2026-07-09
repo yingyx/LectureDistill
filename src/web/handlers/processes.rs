@@ -109,8 +109,11 @@ pub(crate) struct CreateProcessOutputBody {
 fn parse_process_output_kind(kind: &str) -> Option<ProcessOutputKind> {
     match kind {
         "note_patch" => Some(ProcessOutputKind::NotePatch),
+        "builtin.note_patch.note" => Some(ProcessOutputKind::NotePatch),
         "reference_digest" => Some(ProcessOutputKind::ReferenceDigest),
+        "builtin.ref_cheat.ref" => Some(ProcessOutputKind::ReferenceDigest),
         "cheating_sheet" => Some(ProcessOutputKind::CheatingSheet),
+        "builtin.ref_cheat.cheat" => Some(ProcessOutputKind::CheatingSheet),
         _ => None,
     }
 }
@@ -174,20 +177,17 @@ fn expand_output_kinds(
     }
 
     let mut kinds = Vec::new();
-    if has_note_patch || has_reference_digest || has_cheating_sheet {
-        // Note Patch is independent; only add if explicitly requested.
-        if has_note_patch {
-            kinds.push((ProcessOutputKind::NotePatch, 2));
-        }
+    // Note Patch is independent; only add if explicitly requested.
+    if has_note_patch {
+        kinds.push((ProcessOutputKind::NotePatch, 2));
+    }
+    if has_reference_digest || has_cheating_sheet {
+        // Cheating Sheet depends on Reference Digest, so include the ref node
+        // exactly once even when the frontend explicitly selected both.
+        kinds.push((ProcessOutputKind::ReferenceDigest, 0));
     }
     if has_cheating_sheet {
-        // Cheating Sheet depends on Reference Digest, not Note Patch.
-        if !has_reference_digest {
-            kinds.push((ProcessOutputKind::ReferenceDigest, 0));
-        }
         kinds.push((ProcessOutputKind::CheatingSheet, cheating_sheet_pages));
-    } else if has_reference_digest {
-        kinds.push((ProcessOutputKind::ReferenceDigest, 0));
     }
     Ok(kinds)
 }
@@ -340,10 +340,11 @@ pub(crate) async fn api_create_process(
                 "markdown_path": markdown_path.to_string_lossy().to_string(),
             });
         }
-
         outputs.push(ProcessOutput {
             id: output_id,
             kind: kind.clone(),
+            plugin_id: kind.plugin_id().to_string(),
+            node_id: kind.node_id().to_string(),
             status: ProcessRecordStatus::Processing,
             title: process_output_title(kind).to_string(),
             path: output_path.to_string_lossy().to_string(),
@@ -559,9 +560,7 @@ pub(crate) async fn api_retry_process_output(
     State(state): State<AppState>,
     Path((process_id, output_id)): Path<(String, String)>,
 ) -> Json<serde_json::Value> {
-    use crate::processors::cheating_sheet::run_cheating_sheet_outputs;
-    use crate::processors::note_patch::run_note_patch;
-    use crate::processors::reference_digest::run_reference_digest_outputs;
+    use crate::pipelines::run_process_outputs as run_outputs;
     use crate::utils::output::web_log;
 
     let saved_secrets = state.secrets.load();
@@ -612,7 +611,6 @@ pub(crate) async fn api_retry_process_output(
     };
 
     // Persist the reset.
-    let output_kind = target_output.kind.clone();
     let _ = state.process_store.update(&process_id, |r| {
         r.status = ProcessRecordStatus::Processing;
         r.last_error = None;
@@ -645,34 +643,15 @@ pub(crate) async fn api_retry_process_output(
             .build()
             .unwrap();
         rt.block_on(async {
-            match output_kind {
-                ProcessOutputKind::NotePatch => {
-                    run_note_patch(
-                        &pid,
-                        &src_ids,
-                        &[target_output],
-                        &process_store,
-                        &source_store,
-                        &job.job_id,
-                    )
-                    .await;
-                }
-                ProcessOutputKind::ReferenceDigest => {
-                    run_reference_digest_outputs(
-                        &pid,
-                        &src_ids,
-                        &[target_output],
-                        &process_store,
-                        &source_store,
-                        &job.job_id,
-                    )
-                    .await;
-                }
-                ProcessOutputKind::CheatingSheet => {
-                    run_cheating_sheet_outputs(&pid, &[target_output], &process_store, &job.job_id)
-                        .await;
-                }
-            }
+            run_outputs(
+                &pid,
+                &src_ids,
+                &[target_output],
+                &process_store,
+                &source_store,
+                &job.job_id,
+            )
+            .await;
         });
 
         update_process_terminal_status(&process_store, &pid, &job.job_id);
@@ -747,6 +726,20 @@ pub(crate) async fn api_stream_process_output(
                 .into_response();
         }
     };
+
+    // Process outputs are already executed by the background node scheduler.
+    // Starting another LLM request while that job is active races on the same
+    // artifact and status record (and the streaming path does not implement
+    // course-transcript retrieval).
+    if stream_would_conflict(&proc.status, &output.status) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Output is already being generated by the background node scheduler. Poll the output endpoint for progress."
+            })),
+        )
+            .into_response();
+    }
 
     let process_store = state.process_store.clone();
     let source_store = state.source_store.clone();
@@ -918,6 +911,14 @@ pub(crate) async fn api_stream_process_output(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+fn stream_would_conflict(
+    process_status: &ProcessRecordStatus,
+    output_status: &ProcessRecordStatus,
+) -> bool {
+    *process_status == ProcessRecordStatus::Processing
+        || *output_status == ProcessRecordStatus::Processing
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,7 +1117,6 @@ pub(crate) async fn api_add_process_output(
         .outputs
         .iter()
         .any(|o| o.kind == ProcessOutputKind::CheatingSheet);
-
     if requested_kind == ProcessOutputKind::NotePatch && has_note_patch {
         return Json(serde_json::json!({
             "status": "failed",
@@ -1200,6 +1200,8 @@ pub(crate) async fn api_add_process_output(
         new_outputs.push(ProcessOutput {
             id: output_id,
             kind: kind.clone(),
+            plugin_id: kind.plugin_id().to_string(),
+            node_id: kind.node_id().to_string(),
             status: ProcessRecordStatus::Processing,
             title: process_output_title(&kind).to_string(),
             path: output_path.to_string_lossy().to_string(),
@@ -1486,4 +1488,44 @@ pub(crate) async fn api_revise_process_output(
         "has_base_note": output.base_source_id.is_some(),
         "diff_updated": diff_updated,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn requested_output(kind: &str, max_pages: Option<usize>) -> CreateProcessOutputBody {
+        CreateProcessOutputBody {
+            kind: kind.to_string(),
+            max_pages,
+        }
+    }
+
+    #[test]
+    fn expand_output_kinds_keeps_ref_when_ref_and_cheat_are_requested() {
+        let kinds = expand_output_kinds(&[
+            requested_output("reference_digest", None),
+            requested_output("cheating_sheet", Some(2)),
+        ])
+        .unwrap();
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(kinds[0].0, ProcessOutputKind::ReferenceDigest);
+        assert_eq!(kinds[1].0, ProcessOutputKind::CheatingSheet);
+    }
+
+    #[test]
+    fn streaming_cannot_reenter_background_generation() {
+        assert!(stream_would_conflict(
+            &ProcessRecordStatus::Processing,
+            &ProcessRecordStatus::Ready,
+        ));
+        assert!(stream_would_conflict(
+            &ProcessRecordStatus::Ready,
+            &ProcessRecordStatus::Processing,
+        ));
+        assert!(!stream_would_conflict(
+            &ProcessRecordStatus::Ready,
+            &ProcessRecordStatus::Ready,
+        ));
+    }
 }

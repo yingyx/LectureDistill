@@ -868,6 +868,8 @@ async fn cmd_process_run(
         outputs_vec.push(ProcessOutput {
             id: output_id,
             kind: kind.clone(),
+            plugin_id: kind.plugin_id().to_string(),
+            node_id: kind.node_id().to_string(),
             status: ProcessRecordStatus::Processing,
             title: process_output_title(kind).to_string(),
             path: output_path.to_string_lossy().to_string(),

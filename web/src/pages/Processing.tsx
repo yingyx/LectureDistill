@@ -190,6 +190,10 @@ function AddProcessDialog({ onClose, onCreated }: AddProcessDialogProps) {
     const src = sources.find((s) => s.id === id);
     return src?.kind === 'transcript_day';
   }).length;
+  const pdfSourceCount = selectedSourceIds.filter((id) => {
+    const src = sources.find((s) => s.id === id);
+    return src?.kind === 'canvas_pdf_file';
+  }).length;
 
   const handleToggleSource = (id: string) => {
     setSelectedSourceIds((prev) =>
@@ -304,6 +308,7 @@ function AddProcessDialog({ onClose, onCreated }: AddProcessDialogProps) {
           <Typography variant="body2" color="text.secondary">
             Selected: {selectedSourceIds.length} source(s) ({noteSourceCount} note,{' '}
             {courseSourceCount} course transcript, {daySourceCount} transcript day)
+            {pdfSourceCount > 0 ? `, ${pdfSourceCount} PDF` : ''}
           </Typography>
           {courseSourceCount > 0 && (
             <Alert severity="info">
@@ -406,7 +411,6 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
   const [addingOutput, setAddingOutput] = useState(false);
   const [addOutputError, setAddOutputError] = useState<string | null>(null);
   const [cheatingSheetMaxPages, setCheatingSheetMaxPages] = useState(2);
-  const [streamText, setStreamText] = useState<string | null>(null);
 
   const selectedOutput = process.outputs.find(
     (o) => o.id === selectedOutputId,
@@ -442,26 +446,6 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
     }, 3000);
     return () => clearInterval(timer);
   }, [process.status, selectedOutputId, onRefresh, loadOutputContent]);
-
-  // Auto-connect to SSE streaming when viewing a processing output.
-  useEffect(() => {
-    if (!selectedOutputId || selectedOutput?.status !== 'processing') {
-      setStreamText(null);
-      return;
-    }
-    setStreamText('');
-    const url = api.streamProcessOutputUrl(process.id, selectedOutputId);
-    const es = new EventSource(url);
-    es.addEventListener('chunk', (e: MessageEvent) => {
-      setStreamText((prev) => (prev ?? '') + e.data);
-    });
-    es.addEventListener('done', () => {
-      es.close();
-      onRefresh();
-    });
-    es.addEventListener('error', () => es.close());
-    return () => es.close();
-  }, [process.id, selectedOutputId, selectedOutput?.status, onRefresh]);
 
   const handleRevise = async () => {
     if (!selectedOutputId || !instruction.trim()) return;
@@ -660,20 +644,14 @@ function ProcessDetail({ process, onRefresh, onClose }: ProcessDetailProps) {
                         variant="outlined"
                         sx={{ p: 2, maxHeight: 400, overflow: 'auto' }}
                       >
-                        {streamText !== null ? (
-                          <Box>
-                            <Chip label="Live" color="warning" size="small" sx={{ mb: 1 }} />
-                            <Box className="markdown-body">
-                              <ReactMarkdown>{streamText || '*Waiting for output...*'}</ReactMarkdown>
-                            </Box>
-                            <Box component="span" sx={{ animation: 'blink 1s infinite', color: 'warning.main' }}>▌</Box>
-                            <style>{`@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0; } }`}</style>
-                          </Box>
-                        ) : (
-                          <Box className="markdown-body">
-                            <ReactMarkdown>{outputContent.markdown || '(empty markdown)'}</ReactMarkdown>
-                          </Box>
-                        )}
+                        <Box className="markdown-body">
+                          <ReactMarkdown>
+                            {outputContent.markdown ||
+                              (selectedOutput.status === 'processing'
+                                ? '*Waiting for background output...*'
+                                : '(empty markdown)')}
+                          </ReactMarkdown>
+                        </Box>
                       </Paper>
                     )}
 

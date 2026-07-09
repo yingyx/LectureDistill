@@ -4,7 +4,7 @@
 // Source types
 // ---------------------------------------------------------------------------
 
-export type SourceKind = 'transcript_day' | 'transcript_course' | 'note';
+export type SourceKind = 'transcript_day' | 'transcript_course' | 'note' | 'canvas_pdf_file';
 export type SourceStatus = 'ready' | 'processing' | 'failed';
 
 export interface SourceRecord {
@@ -168,6 +168,31 @@ export interface CreateProcessResponse {
   process_id?: string;
   job_id?: string;
   error?: string;
+}
+
+export interface OutputNodeDescriptor {
+  key: string;
+  plugin_id: string;
+  node_id: string;
+  display_name: string;
+  legacy_kind: string;
+  artifact_ext: string;
+  depends_on: string[];
+}
+
+export interface PluginDescriptor {
+  id: string;
+  version: string;
+  display_name: string;
+  kind: 'input' | 'output';
+  nodes: OutputNodeDescriptor[];
+  config_schema: Record<string, unknown>;
+  actions: string[];
+}
+
+export interface PluginsResponse {
+  plugins: PluginDescriptor[];
+  config: Record<string, Record<string, unknown>>;
 }
 
 export interface ReviseResponse {
@@ -480,6 +505,18 @@ class ApiClient {
     });
   }
 
+  async createCanvasPdfSource(params: {
+    course_id: string;
+    file_id?: string;
+    file_name: string;
+    source_url: string;
+  }): Promise<SourceActionResponse> {
+    return this.fetch('/api/sources/canvas-pdf', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
   async syncSource(id: string): Promise<SourceActionResponse> {
     return this.fetch(`/api/sources/${id}/sync`, { method: 'POST' });
   }
@@ -524,6 +561,39 @@ class ApiClient {
 
   async getLlmLog(logId: string): Promise<Record<string, unknown>> {
     return this.fetch(`/api/llm-logs/${encodeURIComponent(logId)}`);
+  }
+
+  // Plugins
+  async getPlugins(): Promise<PluginsResponse> {
+    return this.fetch('/api/plugins');
+  }
+
+  async getPluginConfig(pluginId: string): Promise<{ plugin_id: string; config: Record<string, unknown> }> {
+    return this.fetch(`/api/plugins/${encodeURIComponent(pluginId)}/config`);
+  }
+
+  async patchPluginConfig(
+    pluginId: string,
+    fields: Record<string, unknown>,
+  ): Promise<{ status: string; plugin_id: string; config: Record<string, unknown>; error?: string }> {
+    return this.fetch(`/api/plugins/${encodeURIComponent(pluginId)}/config`, {
+      method: 'PATCH',
+      body: JSON.stringify({ fields }),
+    });
+  }
+
+  async pluginAction(
+    pluginId: string,
+    action: string,
+    fields: Record<string, unknown> = {},
+  ): Promise<{ status: string; plugin_id: string; action: string; result?: unknown; error?: string }> {
+    return this.fetch(
+      `/api/plugins/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(action)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(fields),
+      },
+    );
   }
 
   // Processes

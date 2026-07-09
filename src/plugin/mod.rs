@@ -1,41 +1,9 @@
-//! Plugin infrastructure for extensible Sources and Processors.
+//! Node-based plugin infrastructure.
 //!
-//! The plugin system enables adding new data sources (Canvas videos, YouTube, PDFs,
-//! etc.) and new output processors (Note Patch, Reference Digest, Cheating Sheet,
-//! Flashcards, etc.) without modifying core framework code.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────┐
-//! │  plugin::registry::{SourceRegistry,              │
-//! │    ProcessorRegistry, PipelineRegistry}           │
-//! └──────────┬──────────────┬────────────────────────┘
-//!            │              │
-//!   ┌────────▼──────┐  ┌───▼──────────────────┐
-//!   │ SourcePlugin  │  │ ProcessorPlugin       │
-//!   │ (data input)  │  │ (output generation)   │
-//!   └───────────────┘  └───────────────────────┘
-//!                              │
-//!                     ┌────────▼──────────┐
-//!                     │ PipelineStrategy   │
-//!                     │ (cross-processor   │
-//!                     │  orchestration)    │
-//!                     └───────────────────┘
-//! ```
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! use crate::plugin::registry::ProcessorRegistry;
-//! use crate::processors::note_patch::NotePatchProcessor;
-//!
-//! let registry = ProcessorRegistry::new();
-//! registry.register(Box::new(NotePatchProcessor));
-//! ```
+//! A plugin can expose one or more output nodes. Nodes, not whole plugins, are
+//! the dependency unit: for example `builtin.ref_cheat` exposes both
+//! `builtin.ref_cheat.ref` and `builtin.ref_cheat.cheat`, and other plugins can
+//! depend on either node.
 
-pub mod pipeline;
-pub mod processor;
-pub mod registry;
-pub mod source;
-pub mod types;
+pub mod builtins;
+pub mod node;

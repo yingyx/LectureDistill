@@ -412,6 +412,14 @@ pub(crate) async fn api_get_source_index(
             })),
         )
             .into_response(),
+        SourceKind::CanvasPdfFile => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "failed",
+                "error": "Canvas PDF sources do not have transcript indexes.",
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -432,6 +440,13 @@ pub(crate) async fn api_reindex_source(
             }));
         }
     };
+
+    if source.kind == SourceKind::CanvasPdfFile {
+        return Json(serde_json::json!({
+            "status": "failed",
+            "error": "Canvas PDF sources are not transcript indexes and cannot be reindexed.",
+        }));
+    }
 
     let saved_secrets = state.secrets.load();
     saved_secrets.apply_to_env();
@@ -618,6 +633,10 @@ pub(crate) async fn api_reindex_source(
             "status": "failed",
             "error": "Note sources cannot be reindexed as transcript indexes.",
         })),
+        SourceKind::CanvasPdfFile => Json(serde_json::json!({
+            "status": "failed",
+            "error": "Canvas PDF sources are not transcript indexes and cannot be reindexed.",
+        })),
     }
 }
 
@@ -723,6 +742,124 @@ pub(crate) async fn api_create_note_source(
         Ok(inserted) => Json(serde_json::json!({
             "status": "created",
             "source": inserted,
+        })),
+        Err(e) => Json(serde_json::json!({
+            "status": "failed",
+            "error": format!("Failed to save source: {}", e),
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/sources/canvas-pdf
+// ---------------------------------------------------------------------------
+
+/// `POST /api/sources/canvas-pdf` -- import a Canvas PDF file by URL.
+///
+/// Body: `{ course_id: string, file_id?: string, file_name: string, source_url: string }`
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateCanvasPdfSourceBody {
+    pub course_id: String,
+    #[serde(default)]
+    pub file_id: String,
+    pub file_name: String,
+    pub source_url: String,
+}
+
+pub(crate) async fn api_create_canvas_pdf_source(
+    State(state): State<AppState>,
+    Json(body): Json<CreateCanvasPdfSourceBody>,
+) -> Json<serde_json::Value> {
+    if body.course_id.trim().is_empty()
+        || body.file_name.trim().is_empty()
+        || body.source_url.trim().is_empty()
+    {
+        return Json(serde_json::json!({
+            "status": "failed",
+            "error": "course_id, file_name, and source_url are required.",
+        }));
+    }
+
+    let saved_secrets = state.secrets.load();
+    let mut request = reqwest::Client::new().get(body.source_url.trim());
+    if !saved_secrets.canvas_token.is_empty() {
+        request = request.bearer_auth(saved_secrets.canvas_token);
+    } else if let Some(cookie) = saved_secrets.canvas_auth_cookie() {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "failed",
+                "error": format!("Failed to download Canvas PDF: {}", e),
+            }));
+        }
+    };
+    if !response.status().is_success() {
+        return Json(serde_json::json!({
+            "status": "failed",
+            "error": format!("Canvas PDF download failed with HTTP {}", response.status()),
+        }));
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "failed",
+                "error": format!("Failed to read Canvas PDF response: {}", e),
+            }));
+        }
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = state
+        .source_store
+        .artifact_path(&SourceKind::CanvasPdfFile, &id, "pdf");
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return Json(serde_json::json!({
+                "status": "failed",
+                "error": format!("Failed to create source directory: {}", e),
+            }));
+        }
+    }
+    if let Err(e) = fs::write(&path, &bytes) {
+        return Json(serde_json::json!({
+            "status": "failed",
+            "error": format!("Failed to write PDF source: {}", e),
+        }));
+    }
+
+    let now = SourceRecord::now_iso();
+    let record = SourceRecord {
+        id: id.clone(),
+        kind: SourceKind::CanvasPdfFile,
+        title: body.file_name.trim().to_string(),
+        status: SourceStatus::Ready,
+        created_at: now.clone(),
+        updated_at: now,
+        length: Some(format!("{} bytes", bytes.len())),
+        path: path.to_string_lossy().to_string(),
+        metadata: serde_json::json!({
+            "course_id": body.course_id.trim(),
+            "file_id": body.file_id.trim(),
+            "file_name": body.file_name.trim(),
+            "mime_type": "application/pdf",
+            "source_url": body.source_url.trim(),
+            "size_bytes": bytes.len(),
+            "plugin_id": SourceKind::CanvasPdfFile.plugin_id(),
+        }),
+        last_error: None,
+        job_id: None,
+    };
+
+    match state.source_store.insert(record.clone()) {
+        Ok(source) => Json(serde_json::json!({
+            "status": "succeeded",
+            "source": source,
+            "source_id": id,
         })),
         Err(e) => Json(serde_json::json!({
             "status": "failed",
@@ -2043,6 +2180,72 @@ pub(crate) async fn api_sync_source(
                 "source_id": id,
                 "job_id": job.job_id,
                 "message": "Course sync started as background job."
+            }))
+        }
+        SourceKind::CanvasPdfFile => {
+            let source_url = source
+                .metadata
+                .get("source_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if source_url.trim().is_empty() {
+                return Json(serde_json::json!({
+                    "status": "failed",
+                    "error": "Canvas PDF source metadata missing source_url"
+                }));
+            }
+
+            let saved_secrets = state.secrets.load();
+            let mut request = reqwest::Client::new().get(source_url.trim());
+            if !saved_secrets.canvas_token.is_empty() {
+                request = request.bearer_auth(saved_secrets.canvas_token);
+            } else if let Some(cookie) = saved_secrets.canvas_auth_cookie() {
+                request = request.header(reqwest::header::COOKIE, cookie);
+            }
+
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "status": "failed",
+                        "error": format!("Failed to download Canvas PDF: {}", e),
+                    }));
+                }
+            };
+            if !response.status().is_success() {
+                return Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("Canvas PDF download failed with HTTP {}", response.status()),
+                }));
+            }
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "status": "failed",
+                        "error": format!("Failed to read Canvas PDF response: {}", e),
+                    }));
+                }
+            };
+            if let Err(e) = fs::write(&source.path, &bytes) {
+                return Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("Failed to write PDF artifact: {}", e),
+                }));
+            }
+            let _ = state.source_store.update(&id, |record| {
+                record.status = SourceStatus::Ready;
+                record.length = Some(format!("{} bytes", bytes.len()));
+                record.last_error = None;
+                if let Some(meta) = record.metadata.as_object_mut() {
+                    meta.insert("size_bytes".to_string(), serde_json::json!(bytes.len()));
+                }
+            });
+            Json(serde_json::json!({
+                "status": "succeeded",
+                "source_id": id,
+                "message": "Canvas PDF source synced."
             }))
         }
         SourceKind::Note => Json(serde_json::json!({

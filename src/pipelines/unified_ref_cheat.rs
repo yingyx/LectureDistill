@@ -34,6 +34,7 @@ use crate::utils::markdown::strip_markdown_fences;
 use crate::utils::output::{
     cheating_sheet_markdown_path, process_output_path_for, update_single_output_progress, web_log,
 };
+use crate::web::plugins::ref_cheat_default_template_path;
 use crate::web::processes::{
     ProcessOutput, ProcessOutputKind, ProcessRecord, ProcessStatus as ProcessRecordStatus,
     ProcessStore,
@@ -370,6 +371,10 @@ async fn run_cheat_pipeline_single_pass(
         .map(|s| s.heading.clone())
         .collect::<Vec<_>>()
         .join(" | ");
+    let template_path = ref_cheat_default_template_path(&process_store.project_dir());
+    let template_path_str = template_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
 
     // --- Stage 2 & 3: Cheat Sheet + optional Expansion (per output) ---
 
@@ -383,7 +388,8 @@ async fn run_cheat_pipeline_single_pass(
             .clamp(1, 20);
 
         let ref_digest_chars = digest_markdown.chars().count();
-        let calibration = ensure_calibration(None, &process_store.project_dir());
+        let calibration =
+            ensure_calibration(template_path.as_deref(), &process_store.project_dir());
         let effective = count_effective(&digest_markdown);
         let budget = compute_budget(&calibration, &effective, output_max_pages);
         let lang = budget.language;
@@ -503,7 +509,7 @@ async fn run_cheat_pipeline_single_pass(
         );
         let render_result = latex::render_cheatsheet(
             &markdown_path.to_string_lossy(),
-            None,
+            template_path_str.as_deref(),
             &pdf_path.to_string_lossy(),
             output_max_pages,
         );
@@ -636,7 +642,7 @@ async fn run_cheat_pipeline_single_pass(
                         }
                         let exp_render = latex::render_cheatsheet(
                             &markdown_path.to_string_lossy(),
-                            None,
+                            template_path_str.as_deref(),
                             &pdf_path.to_string_lossy(),
                             output_max_pages,
                         );
@@ -702,7 +708,7 @@ async fn run_cheat_pipeline_single_pass(
                 } else {
                     let fb_render = latex::render_cheatsheet(
                         &markdown_path.to_string_lossy(),
-                        None,
+                        template_path_str.as_deref(),
                         &pdf_path.to_string_lossy(),
                         output_max_pages,
                     );
@@ -740,7 +746,7 @@ async fn run_cheat_pipeline_single_pass(
         let final_render_result = if expansion_used {
             latex::render_cheatsheet(
                 &markdown_path.to_string_lossy(),
-                None,
+                template_path_str.as_deref(),
                 &pdf_path.to_string_lossy(),
                 output_max_pages,
             )
@@ -1055,6 +1061,10 @@ async fn write_digest_and_process_cheat_sheets(
         .map(|s| s.heading.clone())
         .collect::<Vec<_>>()
         .join(" | ");
+    let template_path = ref_cheat_default_template_path(&process_store.project_dir());
+    let template_path_str = template_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
 
     let ref_digest_chars = digest_markdown.chars().count();
     let ref_digest_id = ref_digest_outputs
@@ -1072,7 +1082,8 @@ async fn write_digest_and_process_cheat_sheets(
             .unwrap_or(max_pages)
             .clamp(1, 20);
 
-        let calibration = ensure_calibration(None, &process_store.project_dir());
+        let calibration =
+            ensure_calibration(template_path.as_deref(), &process_store.project_dir());
         let effective = count_effective(digest_markdown);
         let budget = compute_budget(&calibration, &effective, output_max_pages);
         let lang = budget.language;
@@ -1191,7 +1202,7 @@ async fn write_digest_and_process_cheat_sheets(
         );
         let render_result = latex::render_cheatsheet(
             &markdown_path.to_string_lossy(),
-            None,
+            template_path_str.as_deref(),
             &pdf_path.to_string_lossy(),
             output_max_pages,
         );
@@ -1259,7 +1270,7 @@ async fn write_digest_and_process_cheat_sheets(
                     } else {
                         let exp_render = latex::render_cheatsheet(
                             &markdown_path.to_string_lossy(),
-                            None,
+                            template_path_str.as_deref(),
                             &pdf_path.to_string_lossy(),
                             output_max_pages,
                         );
@@ -1315,7 +1326,7 @@ async fn write_digest_and_process_cheat_sheets(
         let final_render_result = if expansion_used {
             latex::render_cheatsheet(
                 &markdown_path.to_string_lossy(),
-                None,
+                template_path_str.as_deref(),
                 &pdf_path.to_string_lossy(),
                 output_max_pages,
             )

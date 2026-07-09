@@ -23,6 +23,7 @@ use crate::web::handlers::{
     jobs::{api_job_status, api_list_jobs, job_status},
     llm_logs::{api_get_llm_log, api_list_llm_logs},
     notes::{api_notes_complete, api_notes_diff},
+    plugins::{api_get_plugin_config, api_get_plugins, api_patch_plugin_config, api_plugin_action},
     processes::{
         api_add_process_output, api_create_process, api_delete_process_output, api_get_process,
         api_get_process_output, api_get_process_output_file, api_get_processes, api_retry_process,
@@ -30,10 +31,10 @@ use crate::web::handlers::{
     },
     secrets::{api_get_secrets, api_patch_secrets},
     sources::{
-        api_ask_source, api_create_note_source, api_create_transcript_course_source,
-        api_create_transcript_day_source, api_delete_source, api_get_source, api_get_source_index,
-        api_get_sources, api_reindex_source, api_source_ask_stream, api_sync_source,
-        api_update_note_source,
+        api_ask_source, api_create_canvas_pdf_source, api_create_note_source,
+        api_create_transcript_course_source, api_create_transcript_day_source, api_delete_source,
+        api_get_source, api_get_source_index, api_get_sources, api_reindex_source,
+        api_source_ask_stream, api_sync_source, api_update_note_source,
     },
     spa::{serve_spa_asset, serve_spa_fallback, serve_spa_index},
     state_config::{api_get_state, api_patch_state},
@@ -112,6 +113,15 @@ pub fn create_app(project_dir: &str) -> Router {
         .route("/api/jobs/{job_id}", get(api_job_status))
         .route("/api/llm-logs", get(api_list_llm_logs))
         .route("/api/llm-logs/{log_id}", get(api_get_llm_log))
+        .route("/api/plugins", get(api_get_plugins))
+        .route(
+            "/api/plugins/{plugin_id}/config",
+            get(api_get_plugin_config).patch(api_patch_plugin_config),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/actions/{action}",
+            post(api_plugin_action),
+        )
         .route("/api/canvas/list-videos", post(api_canvas_list_videos))
         .route(
             "/api/canvas/fetch-subtitles",
@@ -125,6 +135,10 @@ pub fn create_app(project_dir: &str) -> Router {
         // ------------------------------------------------------------------
         .route("/api/sources", get(api_get_sources))
         .route("/api/sources/note", post(api_create_note_source))
+        .route(
+            "/api/sources/canvas-pdf",
+            post(api_create_canvas_pdf_source),
+        )
         .route(
             "/api/sources/transcript-day",
             post(api_create_transcript_day_source),

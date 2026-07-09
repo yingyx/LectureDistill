@@ -27,8 +27,11 @@ pub(crate) fn web_log(message: impl AsRef<str>) {
 pub fn parse_process_output_kind(kind: &str) -> Option<ProcessOutputKind> {
     match kind {
         "note_patch" => Some(ProcessOutputKind::NotePatch),
+        "builtin.note_patch.note" => Some(ProcessOutputKind::NotePatch),
         "reference_digest" => Some(ProcessOutputKind::ReferenceDigest),
+        "builtin.ref_cheat.ref" => Some(ProcessOutputKind::ReferenceDigest),
         "cheating_sheet" => Some(ProcessOutputKind::CheatingSheet),
+        "builtin.ref_cheat.cheat" => Some(ProcessOutputKind::CheatingSheet),
         _ => None,
     }
 }
@@ -167,8 +170,11 @@ pub(crate) fn update_note_patch_progress(
     let total = total.max(1);
     let label = label.to_string();
     let _ = process_store.update(process_id, |r| {
+        r.status = ProcessRecordStatus::Processing;
         for output in &mut r.outputs {
             if output_ids.contains(&output.id) {
+                output.status = ProcessRecordStatus::Processing;
+                output.last_error = None;
                 output.metadata = serde_json::json!({
                     "progress_current": current,
                     "progress_total": total,
@@ -323,6 +329,18 @@ mod tests {
             .any(|(k, _)| *k == ProcessOutputKind::CheatingSheet);
         assert!(has_rd, "ReferenceDigest should be auto-added");
         assert!(has_cs, "CheatingSheet should be present");
+    }
+
+    #[test]
+    fn test_reference_digest_dependency_expansion_keeps_explicit_reference_digest() {
+        let kinds = expand_output_kinds(&[
+            requested_output("reference_digest", None),
+            requested_output("cheating_sheet", Some(2)),
+        ])
+        .unwrap();
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(kinds[0].0, ProcessOutputKind::ReferenceDigest);
+        assert_eq!(kinds[1].0, ProcessOutputKind::CheatingSheet);
     }
 
     #[test]

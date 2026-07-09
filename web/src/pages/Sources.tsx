@@ -60,6 +60,7 @@ function fmtDateTime(iso: string): string {
 function kindLabel(kind: string): string {
   if (kind === 'transcript_day') return 'Transcript Day';
   if (kind === 'transcript_course') return 'Course Transcript';
+  if (kind === 'canvas_pdf_file') return 'Canvas PDF';
   return 'Note';
 }
 
@@ -79,11 +80,14 @@ function statusColor(status: string): 'success' | 'warning' | 'error' | 'default
 function sourceMetadataText(source: SourceRecord): string {
   const meta = source.metadata || {};
   const parts: string[] = [];
-  if (source.kind === 'transcript_day' || source.kind === 'transcript_course') {
+  if (source.kind === 'transcript_day' || source.kind === 'transcript_course' || source.kind === 'canvas_pdf_file') {
     if (meta.course_name) parts.push(`Course: ${String(meta.course_name)}`);
     if (source.kind === 'transcript_day' && meta.date) parts.push(`Date: ${String(meta.date)}`);
     if (source.kind === 'transcript_course' && meta.date_count != null) {
       parts.push(`${Number(meta.date_count)} dates`);
+    }
+    if (source.kind === 'canvas_pdf_file' && meta.file_name) {
+      parts.push(`File: ${String(meta.file_name)}`);
     }
   }
   if (meta.video_count != null) parts.push(`${Number(meta.video_count)} videos`);
@@ -126,7 +130,7 @@ interface AddSourceModalProps {
 }
 
 function AddSourceModal({ onClose, onCreated }: AddSourceModalProps) {
-  const [mode, setMode] = useState<'transcript' | 'course' | 'note' | null>(null);
+  const [mode, setMode] = useState<'transcript' | 'course' | 'note' | 'pdf' | null>(null);
   const [courses, setCourses] = useState<CanvasCourse[]>([]);
   const [coursesLoading, setCoursesLoading] = useState(false);
   const [coursesError, setCoursesError] = useState<string | null>(null);
@@ -136,6 +140,9 @@ function AddSourceModal({ onClose, onCreated }: AddSourceModalProps) {
   const [courseName, setCourseName] = useState('');
   const [date, setDate] = useState('');
   const [processingLanguage, setProcessingLanguage] = useState('zh');
+  const [pdfFileName, setPdfFileName] = useState('');
+  const [pdfFileId, setPdfFileId] = useState('');
+  const [pdfSourceUrl, setPdfSourceUrl] = useState('');
   const [dates, setDates] = useState<CourseDate[]>([]);
   const [datesLoading, setDatesLoading] = useState(false);
   const [datesError, setDatesError] = useState<string | null>(null);
@@ -296,6 +303,33 @@ function AddSourceModal({ onClose, onCreated }: AddSourceModalProps) {
     }
   };
 
+  const handleSubmitPdf = async () => {
+    if (!courseId || !pdfFileName || !pdfSourceUrl) {
+      setError('Course ID, file name, and source URL are required.');
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await api.createCanvasPdfSource({
+        course_id: courseId,
+        file_id: pdfFileId || undefined,
+        file_name: pdfFileName,
+        source_url: pdfSourceUrl,
+      });
+      if (res.status === 'failed') {
+        setError(res.error || 'Creation failed');
+      } else {
+        onCreated();
+        onClose();
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <Dialog open onClose={onClose} maxWidth="sm" fullWidth>
       <DialogTitle>Add Source</DialogTitle>
@@ -314,6 +348,9 @@ function AddSourceModal({ onClose, onCreated }: AddSourceModalProps) {
               </Button>
               <Button variant="outlined" onClick={() => setMode('note')}>
                 Upload Notes
+              </Button>
+              <Button variant="outlined" onClick={() => setMode('pdf')}>
+                Canvas PDF
               </Button>
             </Stack>
           </Stack>
@@ -429,6 +466,39 @@ function AddSourceModal({ onClose, onCreated }: AddSourceModalProps) {
               </Alert>
             )}
           </Stack>
+        ) : mode === 'pdf' ? (
+          <Stack spacing={2.5} sx={{ mt: 1 }}>
+            <TextField
+              label="Course ID"
+              value={courseId}
+              onChange={(e) => setCourseId(e.target.value)}
+              fullWidth
+            />
+            <TextField
+              label="File Name"
+              value={pdfFileName}
+              onChange={(e) => setPdfFileName(e.target.value)}
+              placeholder="assignment.pdf"
+              fullWidth
+            />
+            <TextField
+              label="File ID (optional)"
+              value={pdfFileId}
+              onChange={(e) => setPdfFileId(e.target.value)}
+              fullWidth
+            />
+            <TextField
+              label="Canvas PDF URL"
+              value={pdfSourceUrl}
+              onChange={(e) => setPdfSourceUrl(e.target.value)}
+              fullWidth
+            />
+            {error && (
+              <Alert severity="error" onClose={() => setError(null)}>
+                {error}
+              </Alert>
+            )}
+          </Stack>
         ) : (
           <Stack spacing={2.5} sx={{ mt: 1 }}>
             <TextField
@@ -497,6 +567,17 @@ function AddSourceModal({ onClose, onCreated }: AddSourceModalProps) {
               disabled={loading || fileContent === null}
             >
               {loading ? 'Uploading...' : 'Create Source'}
+            </Button>
+          </>
+        ) : mode === 'pdf' ? (
+          <>
+            <Button onClick={() => setMode(null)}>Back</Button>
+            <Button
+              variant="contained"
+              onClick={handleSubmitPdf}
+              disabled={loading || !courseId || !pdfFileName || !pdfSourceUrl}
+            >
+              {loading ? 'Importing...' : 'Create PDF Source'}
             </Button>
           </>
         ) : (
@@ -1128,7 +1209,7 @@ export default function Sources() {
 
                   {/* Actions */}
                   <Stack direction="row" spacing={0.5} sx={{ flexShrink: 0 }}>
-                    {(source.kind === 'transcript_day' || source.kind === 'transcript_course') && (
+                    {(source.kind === 'transcript_day' || source.kind === 'transcript_course' || source.kind === 'canvas_pdf_file') && (
                       <Tooltip title="Sync">
                         <IconButton
                           size="small"

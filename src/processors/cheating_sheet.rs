@@ -27,6 +27,7 @@ use crate::utils::markdown::strip_markdown_fences;
 use crate::utils::output::{
     cheating_sheet_markdown_path, process_output_path_for, update_single_output_progress, web_log,
 };
+use crate::web::plugins::ref_cheat_default_template_path;
 use crate::web::processes::{
     ProcessOutput, ProcessOutputKind, ProcessRecord, ProcessStatus as ProcessRecordStatus,
     ProcessStore,
@@ -116,6 +117,10 @@ pub(crate) async fn run_cheating_sheet_outputs(
             None
         }
     };
+    let template_path = ref_cheat_default_template_path(&process_store.project_dir());
+    let template_path_str = template_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
 
     for output in outputs {
         update_single_output_progress(
@@ -137,7 +142,8 @@ pub(crate) async fn run_cheating_sheet_outputs(
         let ref_digest_chars = ref_digest_markdown.chars().count();
 
         // Load or auto-calibrate the template and compute a language-aware budget.
-        let calibration = ensure_calibration(None, &process_store.project_dir());
+        let calibration =
+            ensure_calibration(template_path.as_deref(), &process_store.project_dir());
         let effective = count_effective(&ref_digest_markdown);
         let budget = compute_budget(&calibration, &effective, max_pages);
         let lang = budget.language;
@@ -266,7 +272,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
         );
         let render_result = latex::render_cheatsheet(
             &markdown_path.to_string_lossy(),
-            None,
+            template_path_str.as_deref(),
             &pdf_path.to_string_lossy(),
             max_pages,
         );
@@ -444,7 +450,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
                         }
                         let exp_render = latex::render_cheatsheet(
                             &markdown_path.to_string_lossy(),
-                            None,
+                            template_path_str.as_deref(),
                             &pdf_path.to_string_lossy(),
                             max_pages,
                         );
@@ -510,7 +516,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
                 } else {
                     let fb_render = latex::render_cheatsheet(
                         &markdown_path.to_string_lossy(),
-                        None,
+                        template_path_str.as_deref(),
                         &pdf_path.to_string_lossy(),
                         max_pages,
                     );
@@ -549,7 +555,7 @@ pub(crate) async fn run_cheating_sheet_outputs(
             // Re-render to get fresh artifact (the expansion already wrote the file).
             latex::render_cheatsheet(
                 &markdown_path.to_string_lossy(),
-                None,
+                template_path_str.as_deref(),
                 &pdf_path.to_string_lossy(),
                 max_pages,
             )
@@ -648,9 +654,13 @@ pub(crate) fn finish_cheating_sheet_render(
         &output.id,
         &ProcessOutputKind::CheatingSheet,
     );
+    let template_path = ref_cheat_default_template_path(&process_store.project_dir());
+    let template_path_str = template_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
     let render_result = latex::render_cheatsheet(
         &markdown_path.to_string_lossy(),
-        None,
+        template_path_str.as_deref(),
         &pdf_path.to_string_lossy(),
         max_pages,
     );

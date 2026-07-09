@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api, type SecretStatus } from '../api';
+import { api, type SecretStatus, type PluginDescriptor } from '../api';
 import {
   Button,
   Card,
@@ -42,6 +42,12 @@ function SecretBadge({ set, masked }: { set: boolean; masked: string }) {
   return <Chip label={`Saved ${masked}`} size="small" color="success" />;
 }
 
+type RefCheatTemplate = {
+  name: string;
+  path: string;
+  calibrated_at?: string;
+};
+
 export default function Settings() {
   const [status, setStatus] = useState<SecretStatus>(emptyStatus);
   const [message, setMessage] = useState<string | null>(null);
@@ -56,6 +62,10 @@ export default function Settings() {
   const [jaccountCookie, setJaccountCookie] = useState('');
   const [llmMaxConcurrency, setLlmMaxConcurrency] = useState('2');
   const [typstPath, setTypstPath] = useState('');
+  const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
+  const [pluginConfig, setPluginConfig] = useState<Record<string, Record<string, unknown>>>({});
+  const [refCheatTemplatePath, setRefCheatTemplatePath] = useState('');
+  const [pluginActionBusy, setPluginActionBusy] = useState(false);
 
   const loadSecrets = async () => {
     try {
@@ -81,9 +91,21 @@ export default function Settings() {
     }
   };
 
+  const loadPlugins = async () => {
+    try {
+      const res = await api.getPlugins();
+      setPlugins(res.plugins || []);
+      setPluginConfig(res.config || {});
+    } catch {
+      setPlugins([]);
+      setPluginConfig({});
+    }
+  };
+
   useEffect(() => {
     loadSecrets();
     loadConfig();
+    loadPlugins();
   }, []);
 
   const save = async (clear: string[] = []) => {
@@ -138,6 +160,43 @@ export default function Settings() {
       setError(String(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const refCheatTemplates = (): RefCheatTemplate[] => {
+    const templates = pluginConfig['builtin.ref_cheat']?.templates;
+    if (!Array.isArray(templates)) return [];
+    const parsed: RefCheatTemplate[] = [];
+    for (const template of templates) {
+      if (!template || typeof template !== 'object') continue;
+      const item = template as Record<string, unknown>;
+      const name = typeof item.name === 'string' ? item.name : '';
+      const path = typeof item.path === 'string' ? item.path : '';
+      if (!name || !path) continue;
+      const calibrated = typeof item.calibrated_at === 'string' ? item.calibrated_at : undefined;
+      parsed.push({ name, path, calibrated_at: calibrated });
+    }
+    return parsed;
+  };
+
+  const refCheatDefaultTemplate = () => {
+    const value = pluginConfig['builtin.ref_cheat']?.default_template;
+    return typeof value === 'string' ? value : '';
+  };
+
+  const runRefCheatAction = async (action: string, fields: Record<string, unknown>) => {
+    setPluginActionBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await api.pluginAction('builtin.ref_cheat', action, fields);
+      if (res.status !== 'ok') throw new Error(res.error || `Plugin action failed: ${action}`);
+      await loadPlugins();
+      setMessage(`Plugin action completed: ${action}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPluginActionBusy(false);
     }
   };
 
@@ -298,6 +357,117 @@ export default function Settings() {
             </Button>
             <Button variant="outlined" size="small" onClick={() => clearField('canvas_cookie')} disabled={saving} color="error">
               Clear Cookie
+            </Button>
+          </CardActions>
+        </Card>
+
+        {/* Plugins */}
+        <Card>
+          <CardContent>
+            <Typography variant="h6" sx={{ fontSize: '1.1rem', mb: 2 }}>Plugins</Typography>
+            <Stack spacing={1.5}>
+              {plugins.map((plugin) => (
+                <Box key={plugin.id} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 1.5 }}>
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+                    <Typography variant="body2" fontWeight={600}>{plugin.display_name}</Typography>
+                    <Chip label={plugin.kind} size="small" variant="outlined" />
+                    <Chip label={plugin.id} size="small" />
+                  </Stack>
+                  {plugin.nodes.length > 0 && (
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Nodes: {plugin.nodes.map((node) => node.key).join(', ')}
+                    </Typography>
+                  )}
+                  {plugin.actions.length > 0 && (
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Actions: {plugin.actions.join(', ')}
+                    </Typography>
+                  )}
+                  {pluginConfig[plugin.id] && Object.keys(pluginConfig[plugin.id]).length > 0 && (
+                    <Box component="pre" sx={{ mt: 1, mb: 0, fontSize: '0.75rem', whiteSpace: 'pre-wrap' }}>
+                      {JSON.stringify(pluginConfig[plugin.id], null, 2)}
+                    </Box>
+                  )}
+                  {plugin.id === 'builtin.ref_cheat' && (
+                    <Box sx={{ mt: 1.5 }}>
+                      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                        <TextField
+                          label="Template path"
+                          size="small"
+                          fullWidth
+                          value={refCheatTemplatePath}
+                          onChange={(e) => setRefCheatTemplatePath(e.target.value)}
+                          placeholder="D:\\path\\to\\template.typ"
+                        />
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          disabled={pluginActionBusy || !refCheatTemplatePath.trim()}
+                          onClick={() => runRefCheatAction('import_template', {
+                            path: refCheatTemplatePath.trim(),
+                            make_default: refCheatTemplates().length === 0,
+                          })}
+                        >
+                          Import
+                        </Button>
+                      </Stack>
+                      <Stack spacing={1} sx={{ mt: 1 }}>
+                        {refCheatTemplates().map((template) => {
+                          const isDefault = template.path === refCheatDefaultTemplate();
+                          return (
+                            <Stack
+                              key={template.path}
+                              direction={{ xs: 'column', sm: 'row' }}
+                              alignItems={{ xs: 'stretch', sm: 'center' }}
+                              spacing={1}
+                              sx={{ borderTop: 1, borderColor: 'divider', pt: 1 }}
+                            >
+                              <Box sx={{ flex: 1, minWidth: 0 }}>
+                                <Typography variant="body2" fontWeight={500}>{template.name}</Typography>
+                                <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-all' }}>
+                                  {template.path}
+                                </Typography>
+                              </Box>
+                              {isDefault && <Chip label="Default" size="small" color="primary" />}
+                              {template.calibrated_at && <Chip label="Calibrated" size="small" color="success" />}
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                disabled={pluginActionBusy || isDefault}
+                                onClick={() => runRefCheatAction('set_default_template', { template: template.name })}
+                              >
+                                Default
+                              </Button>
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                disabled={pluginActionBusy}
+                                onClick={() => runRefCheatAction('calibrate_template', { template: template.name })}
+                              >
+                                Calibrate
+                              </Button>
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                disabled={pluginActionBusy}
+                                onClick={() => runRefCheatAction('delete_template', { template: template.name })}
+                              >
+                                Delete
+                              </Button>
+                            </Stack>
+                          );
+                        })}
+                      </Stack>
+                    </Box>
+                  )}
+                </Box>
+              ))}
+            </Stack>
+          </CardContent>
+          <CardActions sx={{ px: 2, pb: 2 }}>
+            <Button variant="outlined" size="small" onClick={loadPlugins} disabled={saving}>
+              Refresh Plugins
             </Button>
           </CardActions>
         </Card>

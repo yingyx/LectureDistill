@@ -36,6 +36,35 @@ impl std::fmt::Display for ProcessOutputKind {
     }
 }
 
+impl ProcessOutputKind {
+    pub fn legacy_id(&self) -> &'static str {
+        match self {
+            Self::NotePatch => "note_patch",
+            Self::ReferenceDigest => "reference_digest",
+            Self::CheatingSheet => "cheating_sheet",
+        }
+    }
+
+    pub fn plugin_id(&self) -> &'static str {
+        match self {
+            Self::NotePatch => "builtin.note_patch",
+            Self::ReferenceDigest | Self::CheatingSheet => "builtin.ref_cheat",
+        }
+    }
+
+    pub fn node_id(&self) -> &'static str {
+        match self {
+            Self::NotePatch => "note",
+            Self::ReferenceDigest => "ref",
+            Self::CheatingSheet => "cheat",
+        }
+    }
+
+    pub fn node_key(&self) -> String {
+        format!("{}.{}", self.plugin_id(), self.node_id())
+    }
+}
+
 /// Processing status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +91,12 @@ pub struct ProcessOutput {
     pub id: String,
     /// Kind of output method (e.g. "note_patch").
     pub kind: ProcessOutputKind,
+    /// Plugin that owns this output node.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin_id: String,
+    /// Node within `plugin_id` that this output instance represents.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_id: String,
     /// Status of this output.
     pub status: ProcessStatus,
     /// Human-readable title.
@@ -84,6 +119,25 @@ pub struct ProcessOutput {
     /// Extensible status metadata, e.g. progress counters.
     #[serde(default)]
     pub metadata: serde_json::Value,
+}
+
+impl ProcessOutput {
+    pub fn normalize_node_identity(&mut self) {
+        if self.plugin_id.trim().is_empty() {
+            self.plugin_id = self.kind.plugin_id().to_string();
+        }
+        if self.node_id.trim().is_empty() {
+            self.node_id = self.kind.node_id().to_string();
+        }
+    }
+
+    pub fn node_key(&self) -> String {
+        if self.plugin_id.trim().is_empty() || self.node_id.trim().is_empty() {
+            self.kind.node_key()
+        } else {
+            format!("{}.{}", self.plugin_id, self.node_id)
+        }
+    }
 }
 
 /// A single process record in the registry.
@@ -168,7 +222,16 @@ impl ProcessStore {
     /// or corrupted.
     pub fn load_all(&self) -> Vec<ProcessRecord> {
         match fs::read_to_string(&self.path) {
-            Ok(content) => serde_json::from_str::<Vec<ProcessRecord>>(&content).unwrap_or_default(),
+            Ok(content) => {
+                let mut records =
+                    serde_json::from_str::<Vec<ProcessRecord>>(&content).unwrap_or_default();
+                for record in &mut records {
+                    for output in &mut record.outputs {
+                        output.normalize_node_identity();
+                    }
+                }
+                records
+            }
             Err(_) => Vec::new(),
         }
     }
@@ -270,6 +333,8 @@ mod tests {
         let output = ProcessOutput {
             id: "out1".to_string(),
             kind: ProcessOutputKind::NotePatch,
+            plugin_id: ProcessOutputKind::NotePatch.plugin_id().to_string(),
+            node_id: ProcessOutputKind::NotePatch.node_id().to_string(),
             status: ProcessStatus::Ready,
             title: "Note Patch".to_string(),
             path: "artifacts/processes/p1/out1.md".to_string(),
@@ -346,6 +411,10 @@ mod tests {
         assert_eq!(
             ProcessOutputKind::CheatingSheet.to_string(),
             "cheating_sheet"
+        );
+        assert_eq!(
+            ProcessOutputKind::CheatingSheet.node_key(),
+            "builtin.ref_cheat.cheat"
         );
     }
 
@@ -467,6 +536,8 @@ mod tests {
                 r.outputs.push(ProcessOutput {
                     id: output_id.clone(),
                     kind: ProcessOutputKind::NotePatch,
+                    plugin_id: ProcessOutputKind::NotePatch.plugin_id().to_string(),
+                    node_id: ProcessOutputKind::NotePatch.node_id().to_string(),
                     status: ProcessStatus::Ready,
                     title: "Note Patch".to_string(),
                     path: "some/path.md".to_string(),
@@ -493,6 +564,8 @@ mod tests {
         record.outputs.push(ProcessOutput {
             id: "out-to-remove".to_string(),
             kind: ProcessOutputKind::NotePatch,
+            plugin_id: ProcessOutputKind::NotePatch.plugin_id().to_string(),
+            node_id: ProcessOutputKind::NotePatch.node_id().to_string(),
             status: ProcessStatus::Ready,
             title: "Note Patch".to_string(),
             path: "some/path.md".to_string(),
@@ -525,6 +598,8 @@ mod tests {
         r2.outputs.push(ProcessOutput {
             id: "out1".to_string(),
             kind: ProcessOutputKind::NotePatch,
+            plugin_id: ProcessOutputKind::NotePatch.plugin_id().to_string(),
+            node_id: ProcessOutputKind::NotePatch.node_id().to_string(),
             status: ProcessStatus::Failed,
             title: "Bad output".to_string(),
             path: "bad.md".to_string(),

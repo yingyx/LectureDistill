@@ -30,6 +30,7 @@ pub enum SourceKind {
     TranscriptDay,
     TranscriptCourse,
     Note,
+    CanvasPdfFile,
 }
 
 impl std::fmt::Display for SourceKind {
@@ -38,6 +39,18 @@ impl std::fmt::Display for SourceKind {
             Self::TranscriptDay => write!(f, "transcript_day"),
             Self::TranscriptCourse => write!(f, "transcript_course"),
             Self::Note => write!(f, "note"),
+            Self::CanvasPdfFile => write!(f, "canvas_pdf_file"),
+        }
+    }
+}
+
+impl SourceKind {
+    pub fn plugin_id(&self) -> &'static str {
+        match self {
+            Self::TranscriptDay => "builtin.canvas.transcript_day",
+            Self::TranscriptCourse => "builtin.canvas.transcript_course",
+            Self::Note => "builtin.note",
+            Self::CanvasPdfFile => "builtin.canvas.pdf_file",
         }
     }
 }
@@ -205,6 +218,10 @@ impl SourceStore {
             SourceKind::Note => self
                 .artifacts_dir
                 .join("notes")
+                .join(format!("{}.{}", id, ext)),
+            SourceKind::CanvasPdfFile => self
+                .artifacts_dir
+                .join("canvas-pdf")
                 .join(format!("{}.{}", id, ext)),
         }
     }
@@ -378,6 +395,10 @@ mod tests {
     fn test_source_kind_display() {
         assert_eq!(SourceKind::TranscriptDay.to_string(), "transcript_day");
         assert_eq!(SourceKind::Note.to_string(), "note");
+        assert_eq!(
+            SourceKind::CanvasPdfFile.plugin_id(),
+            "builtin.canvas.pdf_file"
+        );
     }
 
     // -----------------------------------------------------------------------

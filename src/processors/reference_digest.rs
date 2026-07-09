@@ -53,12 +53,14 @@ pub(crate) async fn run_reference_digest_outputs(
         .filter(|s| source_ids.contains(&s.id) && s.kind == SourceKind::TranscriptCourse)
         .collect();
 
-    if transcript_sources.is_empty() && course_sources.is_empty() && note_source.is_none() {
+    if transcript_sources.is_empty() && course_sources.is_empty() {
         for output in outputs {
             let _ = process_store.update(process_id, |r| {
                 if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
                     o.status = ProcessRecordStatus::Failed;
-                    o.last_error = Some("No valid sources found for Reference Digest.".to_string());
+                    o.last_error = Some(
+                        "Reference Digest requires at least one transcript source.".to_string(),
+                    );
                 }
             });
         }
@@ -298,6 +300,20 @@ pub(crate) async fn run_reference_digest_outputs(
         digest_markdown
     };
     // --- End Quality Gate ---
+
+    if digest_markdown.trim().is_empty() {
+        let err_msg = "Reference Digest generation returned empty Markdown.".to_string();
+        for output in outputs {
+            let _ = process_store.update(process_id, |r| {
+                if let Some(o) = r.outputs.iter_mut().find(|o| o.id == output.id) {
+                    o.status = ProcessRecordStatus::Failed;
+                    o.last_error = Some(err_msg.clone());
+                    o.updated_at = ProcessRecord::now_iso();
+                }
+            });
+        }
+        return;
+    }
 
     // Write output for each record.
     let source_counts = serde_json::json!({

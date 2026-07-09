@@ -8,6 +8,7 @@ pub mod courses;
 pub mod jobs;
 pub mod llm_logs;
 pub mod notes;
+pub mod plugins;
 pub mod processes;
 pub mod secrets;
 pub mod sources;
