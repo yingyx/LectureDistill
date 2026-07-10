@@ -10,16 +10,8 @@ target/
 web/node_modules/
 web/dist/
 
-# Python
-lecture_distill/
-.venv/
-.uv-cache/
+# Local tool caches
 .npm-cache/
-.pytest_cache/
-__pycache__/
-**/__pycache__/
-*.py[cod]
-*.egg-info/
 build/
 dist/
 web/node_modules/

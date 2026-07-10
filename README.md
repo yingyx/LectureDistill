@@ -2,11 +2,9 @@
 
 SJTU Canvas course video subtitle ingestion, exam-focused distillation, and cheat sheet PDF rendering.
 
-**Primary distribution: Rust binary.** A Python reference implementation is available in `lecture_distill/` for comparison but is not the recommended usage path.
+**Primary distribution: Rust binary.**
 
 ## Installation
-
-### Rust (primary)
 
 ```bash
 # Install via Cargo
@@ -18,12 +16,6 @@ cargo build --release
 ```
 
 **Prerequisites:** [Rust](https://rustup.rs/) >= 1.75.
-
-### Python (legacy reference)
-
-```bash
-pip install -e .
-```
 
 ## Prerequisites
 
@@ -135,7 +127,7 @@ Open http://127.0.0.1:8765 in your browser. The GUI provides:
 - **Cheat Sheet**: render PDF with page count feedback or clear renderer errors
 - **Logs**: view running and completed jobs with status and output
 
-The GUI is server-rendered with no separate frontend build step.
+The GUI is served by the Rust backend and uses the React/Vite frontend under `web/`.
 
 ## Commands
 
@@ -177,14 +169,9 @@ src/
   distill.rs        # Distillation workflow
   latex.rs          # Typst/LaTeX rendering and PDF compilation
   pipeline.rs       # Shared PipelineRunner for CLI and Web
-  web/
-    mod.rs          # Web module root
-    app.rs          # Axum app factory and routes
-    state.rs        # JSON-backed project state (no secrets)
-    jobs.rs         # In-memory background job registry
+  web/              # Axum APIs and SPA serving
+web/                # React/Vite frontend
 ```
-
-The legacy Python reference implementation lives under `lecture_distill/` and is ignored by Git.
 
 ## Development
 

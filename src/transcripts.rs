@@ -1,6 +1,5 @@
 //! SRT subtitle parsing and writing.
 //!
-//! Equivalent to the Python `transcripts.py` module.
 //! Handles SRT and VTT-style timestamp formats, normalises Windows line
 //! endings, and provides round-trip serialisation through
 //! [`TranscriptSegment`] / [`TranscriptArtifact`].

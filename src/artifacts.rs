@@ -1,12 +1,11 @@
 //! Data models for lecture-distill artifacts.
 //!
-//! Equivalent to the Python `artifacts.py` module.
 //! All models derive `Serialize`/`Deserialize` for JSON artifact storage.
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-/// Distillation keep level - mirrors the Python `KeepLevel` enum.
+/// Distillation keep level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeepLevel {

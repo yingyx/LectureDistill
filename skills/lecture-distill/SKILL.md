@@ -12,7 +12,7 @@ Use this skill when the user asks to:
 
 ## How to use
 
-This skill is a thin wrapper around the `lecture-distill` **Rust CLI binary**. The primary distribution is a Cargo-built binary. A Python reference implementation is available under `lecture_distill/` as legacy.
+This skill is a thin wrapper around the `lecture-distill` **Rust CLI binary**. The project is distributed as a Cargo-built binary.
 
 ### Prerequisites
 
@@ -129,12 +129,3 @@ cargo run -- gui --help
 - Only SJTU Canvas video flow is supported (not generic Canvas/Panopto)
 - Videos are not downloaded; only subtitles/transcripts are fetched
 - LaTeX compilation requires a local LaTeX installation
-
-### Legacy Python (reference only)
-
-The Python implementation at `lecture_distill/` is a reference implementation and is **not** the recommended usage path. To use it:
-
-```bash
-pip install -e .
-lecture-distill --help
-```

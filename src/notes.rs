@@ -3,8 +3,6 @@
 //! Loads Markdown notes and transcript artifacts, then patches the notes
 //! with information extracted from video transcripts.  Supports both
 //! LLM-based and deterministic patching strategies.
-//!
-//! Equivalent to the Python `notes.py` module.
 
 use crate::artifacts::{KeepLevel, NoteArtifact, PatchArtifact, PatchEntry, TranscriptArtifact};
 use crate::llm;
