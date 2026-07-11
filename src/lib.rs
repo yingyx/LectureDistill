@@ -11,6 +11,7 @@ pub mod distill;
 pub mod latex;
 pub mod llm;
 pub mod llm_log;
+pub mod markdown_typst;
 pub mod notes;
 pub mod pipeline;
 pub mod pipelines;

@@ -2358,67 +2358,108 @@ pub fn render_cheatsheet(
         };
 
         // --- inner compilation helper (returns (pdf_path, template_name, page_count)) ---
-        // Tries Typst first; falls back to LaTeX on failure.
-        let compile_with_template =
-            |typst_template_str: &str, label: &str| -> Result<(String, String, usize)> {
-                let mut errors: Vec<String> = Vec::new();
+        // Tries the native Rust/MiTeX converter, then the legacy Typst
+        // converter, and finally falls back to LaTeX.
+        let compile_with_template = |typst_template_str: &str,
+                                     label: &str|
+         -> Result<(String, String, usize)> {
+            let mut errors: Vec<String> = Vec::new();
 
-                // Try Typst first.
-                if !typst_compiler.is_empty() {
-                    let typst_body = markdown_to_typst(&working_content);
-                    let filled = typst_template_str.replace("{{content}}", &typst_body);
-                    match fs::write(&typ_path, &filled) {
-                        Ok(_) => match compile_typst(
+            // Try the native Markdown -> Typst converter first.
+            if !typst_compiler.is_empty() {
+                match crate::markdown_typst::markdown_to_typst(&working_content).and_then(
+                    |typst_body| {
+                        crate::markdown_typst::prepare_runtime(&output_dir)?;
+                        let filled = format!(
+                            "{}{}",
+                            crate::markdown_typst::runtime_prelude(),
+                            typst_template_str.replace("{{content}}", &typst_body)
+                        );
+                        fs::write(&typ_path, &filled)
+                            .with_context(|| "failed to write native Typst document")?;
+                        compile_typst(
                             &typ_path.to_string_lossy(),
                             &intermediate_pdf_path.to_string_lossy(),
                             &typst_compiler,
-                        ) {
-                            Ok(_) => {
-                                let page_count =
-                                    count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
-                                return Ok((
-                                    intermediate_pdf_path.to_string_lossy().to_string(),
-                                    label.to_string(),
-                                    page_count,
-                                ));
-                            }
-                            Err(e) => errors.push(format!("typst: {:#}", e)),
-                        },
-                        Err(e) => errors.push(format!("typst write: {:#}", e)),
+                        )
+                        .context("native Typst compilation failed")
+                    },
+                ) {
+                    Ok(_) => {
+                        log::info!("Typst converter selected: rust-mitex");
+                        let page_count = count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
+                        return Ok((
+                            intermediate_pdf_path.to_string_lossy().to_string(),
+                            label.to_string(),
+                            page_count,
+                        ));
+                    }
+                    Err(error) => {
+                        let reason = format!("rust-mitex: {error:#}");
+                        log::warn!(
+                                "native Markdown -> Typst converter failed; trying legacy converter: {reason}"
+                            );
+                        errors.push(reason);
                     }
                 }
 
-                // Fall back to LaTeX.
-                if !compiler.is_empty() {
-                    let latex_body = markdown_to_latex(&working_content);
-                    let filled = template.replace("{{content}}", &latex_body);
-                    match fs::write(&tex_path, &filled) {
-                        Ok(_) => match compile_latex(
-                            &tex_path.to_string_lossy(),
-                            &output_dir.to_string_lossy(),
-                            &compiler,
-                        ) {
-                            Ok(_) => {
-                                let page_count =
-                                    count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
-                                return Ok((
-                                    intermediate_pdf_path.to_string_lossy().to_string(),
-                                    label.to_string(),
-                                    page_count,
-                                ));
-                            }
-                            Err(e) => errors.push(format!("latex: {:#}", e)),
-                        },
-                        Err(e) => errors.push(format!("latex write: {:#}", e)),
-                    }
+                // Transitional fallback: preserve the existing hand-written
+                // converter until the native path has proven stable.
+                let typst_body = markdown_to_typst(&working_content);
+                let filled = typst_template_str.replace("{{content}}", &typst_body);
+                match fs::write(&typ_path, &filled) {
+                    Ok(_) => match compile_typst(
+                        &typ_path.to_string_lossy(),
+                        &intermediate_pdf_path.to_string_lossy(),
+                        &typst_compiler,
+                    ) {
+                        Ok(_) => {
+                            log::info!("Typst converter selected: legacy");
+                            let page_count =
+                                count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
+                            return Ok((
+                                intermediate_pdf_path.to_string_lossy().to_string(),
+                                label.to_string(),
+                                page_count,
+                            ));
+                        }
+                        Err(e) => errors.push(format!("legacy typst: {:#}", e)),
+                    },
+                    Err(e) => errors.push(format!("legacy typst write: {:#}", e)),
                 }
+            }
 
-                if errors.is_empty() {
-                    bail!("no PDF renderer available")
-                } else {
-                    bail!("{}", errors.join("; "))
+            // Fall back to LaTeX.
+            if !compiler.is_empty() {
+                let latex_body = markdown_to_latex(&working_content);
+                let filled = template.replace("{{content}}", &latex_body);
+                match fs::write(&tex_path, &filled) {
+                    Ok(_) => match compile_latex(
+                        &tex_path.to_string_lossy(),
+                        &output_dir.to_string_lossy(),
+                        &compiler,
+                    ) {
+                        Ok(_) => {
+                            let page_count =
+                                count_pdf_pages(&intermediate_pdf_path.to_string_lossy())?;
+                            return Ok((
+                                intermediate_pdf_path.to_string_lossy().to_string(),
+                                label.to_string(),
+                                page_count,
+                            ));
+                        }
+                        Err(e) => errors.push(format!("latex: {:#}", e)),
+                    },
+                    Err(e) => errors.push(format!("latex write: {:#}", e)),
                 }
-            };
+            }
+
+            if errors.is_empty() {
+                bail!("no PDF renderer available")
+            } else {
+                bail!("{}", errors.join("; "))
+            }
+        };
 
         // --- compile ---
         let template_label = if !typst_compiler.is_empty() {
